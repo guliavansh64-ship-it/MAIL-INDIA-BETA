@@ -1,0 +1,30 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "key_index": {
+      ".indexOn": ["keyId", "uid", "status"]
+    },
+    "users": {
+      ".indexOn": ["status", "createdAt", "email"]
+    },
+    "payment_orders": {
+      ".indexOn": ["uid", "status", "paymentId", "createdAt"]
+    },
+    "payment_refunds": {
+      ".indexOn": ["uid", "orderId", "status", "paymentId", "createdAt"]
+    },
+    "payment_disputes": {
+      ".indexOn": ["uid", "orderId", "paymentId", "status"]
+    },
+    "email_logs": {
+      ".indexOn": ["status", "createdAt"]
+    },
+    "support_tickets": {
+      ".indexOn": ["status", "createdAt"]
+    },
+    "admin_logs": {
+      ".indexOn": ["adminId", "action", "createdAt"]
+    }
+  }
+}

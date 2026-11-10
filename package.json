@@ -1,0 +1,32 @@
+{
+  "name": "mailbridge",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node backend/src/server.js",
+    "test": "node --test backend/test/*.test.js",
+    "build:prod": "node backend/scripts/build-prod-encrypted.js",
+    "db:backup": "node backend/scripts/backup-db.js",
+    "db:restore": "node backend/scripts/restore-db.js",
+    "db:migrate": "node backend/scripts/migrate-db.js",
+    "integrity:check": "node backend/scripts/verify-ledger-integrity.js",
+    "purge:logs": "node backend/scripts/purge-email-logs.js"
+  },
+  "dependencies": {
+    "bullmq": "^6.5.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "firebase-admin": "^13.0.2",
+    "helmet": "^8.0.0",
+    "ioredis": "^6.0.0",
+    "nodemailer": "^10.3.1"
+  },
+  "devDependencies": {
+    "supertest": "^7.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

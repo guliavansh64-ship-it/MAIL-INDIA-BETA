@@ -1,0 +1,8 @@
+node_modules/
+.env
+*.service-account.json
+backend/credentials/
+client_secret*.json
+google-oauth-client.json
+dist/
+*.zip
