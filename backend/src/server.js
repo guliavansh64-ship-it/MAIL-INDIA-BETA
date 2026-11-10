@@ -60,7 +60,7 @@ const encryptionKey = (process.env.SENDER_ENCRYPTION_KEY && Buffer.from(process.
   ? process.env.SENDER_ENCRYPTION_KEY
   : require('node:crypto').createHash('sha256').update(process.env.SESSION_SECRET || 'mailbridge-master-session-salt-375ee').digest('base64');
 
-if (process.env.ENABLE_EXPERIMENTAL_SENDING === 'true') {
+if (process.env.ENABLE_EXPERIMENTAL_SENDING !== 'false') {
   if (process.env.REDIS_URL && connection) {
     try {
       const { Queue, Worker } = require('bullmq');
@@ -144,7 +144,7 @@ const app = createApp({
     baseUrl: process.env.ZETPAY_BASE_URL || 'https://zetpay-beta.vercel.app'
   },
   sendingConfig: {
-    enabled: process.env.ENABLE_EXPERIMENTAL_SENDING === 'true',
+    enabled: process.env.ENABLE_EXPERIMENTAL_SENDING !== 'false',
     encryptionKey: (process.env.SENDER_ENCRYPTION_KEY && Buffer.from(process.env.SENDER_ENCRYPTION_KEY, 'base64').length === 32)
       ? process.env.SENDER_ENCRYPTION_KEY
       : require('node:crypto').createHash('sha256').update(process.env.SESSION_SECRET || 'mailbridge-master-session-salt-375ee').digest('base64')

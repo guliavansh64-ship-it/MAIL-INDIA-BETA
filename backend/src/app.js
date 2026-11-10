@@ -251,8 +251,8 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
 
   app.get('/api/health', (req, res) => res.json({
     status: 'ok',
-    sending: sendingConfig.enabled && sendQueue ? 'experimental' : 'disabled',
-    payments: paymentConfig.enabled && paymentConfig.keyId?.startsWith('rzp_test_') ? 'experimental_test_mode' : 'disabled',
+    sending: sendingConfig.enabled && sendQueue ? 'active' : 'disabled',
+    payments: zetProvider ? 'connected' : (paymentConfig.enabled && paymentConfig.keyId?.startsWith('rzp_test_') ? 'test_mode' : 'disabled'),
     zetpay: zetProvider ? 'connected' : 'disabled'
   }));
 
