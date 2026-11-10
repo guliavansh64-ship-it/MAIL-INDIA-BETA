@@ -5,7 +5,10 @@
   "scripts": {
     "start": "node backend/src/server.js",
     "test": "node --test backend/test/*.test.js",
-    "build:prod": "node backend/scripts/build-prod-encrypted.js",
+    "build:clean": "node backend/scripts/build-prod-clean.js",
+    "build:zip": "node backend/scripts/build-prod-clean.js",
+    "build:encrypted": "node backend/scripts/build-prod-encrypted.js",
+    "build:prod": "node backend/scripts/build-prod-clean.js",
     "db:backup": "node backend/scripts/backup-db.js",
     "db:restore": "node backend/scripts/restore-db.js",
     "db:migrate": "node backend/scripts/migrate-db.js",
