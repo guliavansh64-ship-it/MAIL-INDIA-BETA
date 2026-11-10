@@ -32,7 +32,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
         fontSrc: ["'self'", 'https://fonts.gstatic.com', 'https://cdnjs.cloudflare.com'],
         scriptSrc: ["'self'", "'unsafe-inline'", 'https://checkout.razorpay.com', 'https://zetpay.online', 'https://www.gstatic.com'],
         scriptSrcAttr: ["'unsafe-inline'"],
-        connectSrc: ["'self'", 'https://identitytoolkit.googleapis.com', 'https://securetoken.googleapis.com', 'https://*.googleapis.com', 'https://*.firebaseio.com', 'wss://*.firebaseio.com', 'https://api.razorpay.com', 'https://*.razorpay.com', 'https://zetpay-beta.vercel.app', 'https://to-375ee-default-rtdb.firebaseio.com', 'wss://to-375ee-default-rtdb.firebaseio.com'],
+        connectSrc: ["'self'", 'https://identitytoolkit.googleapis.com', 'https://securetoken.googleapis.com', 'https://*.googleapis.com', 'https://*.firebaseio.com', 'wss://*.firebaseio.com', 'https://api.razorpay.com', 'https://*.razorpay.com', 'https://zetpay-beta.vercel.app', 'https://to-375ee-default-rtdb.firebaseio.com', 'wss://to-375ee-default-rtdb.firebaseio.com', 'http://indiamail.toolsnetwork.online', 'https://indiamail.toolsnetwork.online'],
         imgSrc: ["'self'", 'data:', 'https://*.razorpay.com', 'https://zetpay.online', 'https://*.googleusercontent.com', 'https://*.google.com', 'https://*.gstatic.com', 'https://lh3.googleusercontent.com'],
         frameSrc: ['https://api.razorpay.com', 'https://*.razorpay.com', 'https://zetpay.online', 'https://app.zetpay.online', 'https://*.zapupi.com'],
         formAction: ["'self'", 'https://api.razorpay.com', 'https://*.razorpay.com', 'https://zetpay-beta.vercel.app', 'https://app.zetpay.online', 'https://*.zapupi.com']
@@ -45,6 +45,12 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
       if (!origins.length || origins.includes('*') || origins.includes(origin) || process.env.NODE_ENV !== 'production') {
         return cb(null, true);
       }
+      try {
+        const u = new URL(origin);
+        if (u.hostname === 'indiamail.toolsnetwork.online' || u.hostname === 'mailindia.toolsnetwork.online' || u.hostname.endsWith('.toolsnetwork.online') || u.hostname === 'localhost' || u.hostname === '127.0.0.1') {
+          return cb(null, true);
+        }
+      } catch {}
       return cb(null, false);
     },
     credentials: true,

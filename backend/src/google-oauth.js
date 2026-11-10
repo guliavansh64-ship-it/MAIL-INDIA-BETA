@@ -47,8 +47,12 @@ function createGoogleOAuthRoutes({
   };
 
   const getGoogleAuthRedirectUri = req => {
-    if (process.env.GOOGLE_AUTH_REDIRECT_URI) return process.env.GOOGLE_AUTH_REDIRECT_URI;
     const baseUrl = getBaseUrl(req);
+    if (baseUrl.includes('indiamail.toolsnetwork.online')) {
+      const proto = baseUrl.startsWith('https') ? 'https' : 'http';
+      return `${proto}://indiamail.toolsnetwork.online/oauth/oauth/google/callback`;
+    }
+    if (process.env.GOOGLE_AUTH_REDIRECT_URI && (!baseUrl || baseUrl.includes('localhost'))) return process.env.GOOGLE_AUTH_REDIRECT_URI;
     if (fileCredentials?.redirect_uris) {
       const match = fileCredentials.redirect_uris.find(u => u.startsWith(baseUrl) && u.includes('google'));
       if (match) return match;
@@ -60,8 +64,12 @@ function createGoogleOAuthRoutes({
   };
 
   const getGmailRedirectUri = req => {
-    if (process.env.GOOGLE_REDIRECT_URI) return process.env.GOOGLE_REDIRECT_URI;
     const baseUrl = getBaseUrl(req);
+    if (baseUrl.includes('indiamail.toolsnetwork.online')) {
+      const proto = baseUrl.startsWith('https') ? 'https' : 'http';
+      return `${proto}://indiamail.toolsnetwork.online/oauth/gmail/callback`;
+    }
+    if (process.env.GOOGLE_REDIRECT_URI && (!baseUrl || baseUrl.includes('localhost'))) return process.env.GOOGLE_REDIRECT_URI;
     if (fileCredentials?.redirect_uris) {
       const match = fileCredentials.redirect_uris.find(u => u.startsWith(baseUrl) && u.includes('gmail'));
       if (match) return match;
