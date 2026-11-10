@@ -23,6 +23,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
   app.use(helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" },
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'self'"],
@@ -41,7 +42,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
   app.use(cors({
     origin(origin, cb) {
       if (!origin) return cb(null, true);
-      if (origins.includes('*') || origins.includes(origin) || process.env.NODE_ENV !== 'production') {
+      if (!origins.length || origins.includes('*') || origins.includes(origin) || process.env.NODE_ENV !== 'production') {
         return cb(null, true);
       }
       return cb(null, false);
