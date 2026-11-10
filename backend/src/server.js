@@ -13,20 +13,24 @@ let auth = null;
 let db = null;
 let isDev = false;
 
-if (process.env.FIREBASE_DATABASE_URL && process.env.FIREBASE_PROJECT_ID) {
+const fbDatabaseUrl = process.env.FIREBASE_DATABASE_URL || 'https://to-375ee-default-rtdb.firebaseio.com';
+const fbProjectId = process.env.FIREBASE_PROJECT_ID || 'to-375ee';
+const fbApiKey = process.env.FIREBASE_WEB_API_KEY || 'AIzaSyCvfIXHa_6Vy5Qh2Of-ayhUjw1INwujmsE';
+
+if (fbDatabaseUrl && fbProjectId) {
   try {
     db = createFirebaseDatabase({
-      databaseUrl: process.env.FIREBASE_DATABASE_URL
+      databaseUrl: fbDatabaseUrl
     });
     auth = createFirebaseAuth({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      apiKey: process.env.FIREBASE_WEB_API_KEY,
+      projectId: fbProjectId,
+      apiKey: fbApiKey,
       db,
       sessionSecret: process.env.SESSION_SECRET || 'mailbridge-session-secure-secret-key-375ee'
     });
     isDev = false;
-    console.log(`[FIREBASE] Connected to Firebase Project: ${process.env.FIREBASE_PROJECT_ID}`);
-    console.log(`[FIREBASE] Realtime Database: ${process.env.FIREBASE_DATABASE_URL}`);
+    console.log(`[FIREBASE] Connected to Firebase Project: ${fbProjectId}`);
+    console.log(`[FIREBASE] Realtime Database: ${fbDatabaseUrl}`);
     console.log(`[FIREBASE] Live data synchronization active. No demo data loaded.`);
   } catch (err) {
     console.warn(`[FIREBASE] Firebase initialization failed (${err.message}). Starting in fallback mode.`);
