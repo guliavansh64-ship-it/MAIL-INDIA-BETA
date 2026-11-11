@@ -32,7 +32,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
         fontSrc: ["'self'", 'https://fonts.gstatic.com', 'https://cdnjs.cloudflare.com'],
         scriptSrc: ["'self'", "'unsafe-inline'", 'https://checkout.razorpay.com', 'https://zetpay.online', 'https://www.gstatic.com'],
         scriptSrcAttr: ["'unsafe-inline'"],
-        connectSrc: ["'self'", 'https://identitytoolkit.googleapis.com', 'https://securetoken.googleapis.com', 'https://*.googleapis.com', 'https://*.firebaseio.com', 'wss://*.firebaseio.com', 'https://api.razorpay.com', 'https://*.razorpay.com', 'https://zetpay-beta.vercel.app', 'https://to-375ee-default-rtdb.firebaseio.com', 'wss://to-375ee-default-rtdb.firebaseio.com', 'http://indiamail.toolsnetwork.online', 'https://indiamail.toolsnetwork.online'],
+        connectSrc: ["'self'", 'https://identitytoolkit.googleapis.com', 'https://securetoken.googleapis.com', 'https://*.googleapis.com', 'https://*.firebaseio.com', 'wss://*.firebaseio.com', 'https://api.razorpay.com', 'https://*.razorpay.com', 'https://zetpay-beta.vercel.app', 'https://to-375ee-default-rtdb.firebaseio.com', 'wss://to-375ee-default-rtdb.firebaseio.com', 'https://mail-india-beta.vercel.app', 'https://*.vercel.app', 'http://indiamail.toolsnetwork.online', 'https://indiamail.toolsnetwork.online'],
         imgSrc: ["'self'", 'data:', 'https://*.razorpay.com', 'https://zetpay.online', 'https://*.googleusercontent.com', 'https://*.google.com', 'https://*.gstatic.com', 'https://lh3.googleusercontent.com'],
         frameSrc: ['https://api.razorpay.com', 'https://*.razorpay.com', 'https://zetpay.online', 'https://app.zetpay.online', 'https://*.zapupi.com'],
         formAction: ["'self'", 'https://api.razorpay.com', 'https://*.razorpay.com', 'https://zetpay-beta.vercel.app', 'https://app.zetpay.online', 'https://*.zapupi.com']
@@ -1065,7 +1065,7 @@ Core technical platform facts:
 - Complete API Documentation: Accessible at /api-docs.html (or /docs). Completely public, no login required. Includes interactive code snippets for Node.js, Python, PHP, Go, cURL.
 - Google Workspace Relay: 1-click Google OAuth connection delivers via Google Cloud API at a 50% discount with 100% Google primary inbox placement and zero DNS setup required.
 - Cloud SMTP Relay: host 'smtp.mailindia.in', port 587 (TLS 1.3), standard username/API key auth with automated 2048-bit DKIM signing.
-- REST Endpoint: POST https://api.mailindia.in/v1/emails/send with 'Authorization: Bearer <API_KEY>' and JSON payload { "to": "...", "subject": "...", "html": "..." }.
+- REST Endpoint: POST https://mail-india-beta.vercel.app/v1/emails/send with 'Authorization: Bearer <API_KEY>' and JSON payload { "to": "...", "subject": "...", "html": "..." }.
 - Instant UPI wallet recharge via ZetPay (PhonePe, GPay, Paytm, QR). Top-up starts at ₹10.
 - Domestic edge nodes located in Mumbai and Bengaluru (sub-140ms latency).
 - Hard bounce rate threshold is strictly < 5%, spam complaint rate < 0.1% to preserve sender reputation.
@@ -1149,7 +1149,7 @@ CRITICAL RULES:
     else if (qLower.includes('curl') || qLower.includes('send email') || qLower.includes('send test') || qLower.includes('dispatch') || qLower.includes('rest api') || qLower.includes('endpoint') || (qLower.includes('send') && qLower.includes('api'))) {
       reply = `**Sending Email via Mail India REST API (${agentName})**:\n\n` +
         `\`\`\`bash\n` +
-        `curl -X POST https://api.mailindia.in/v1/emails/send \\\n` +
+        `curl -X POST https://mail-india-beta.vercel.app/v1/emails/send \\\n` +
         `  -H "Authorization: Bearer mb_live_your_api_key" \\\n` +
         `  -H "Content-Type: application/json" \\\n` +
         `  -d '{\n` +
@@ -1169,7 +1169,7 @@ CRITICAL RULES:
         `\`\`\`python\n` +
         `import requests\n\n` +
         `res = requests.post(\n` +
-        `    "https://api.mailindia.in/v1/emails/send",\n` +
+        `    "https://mail-india-beta.vercel.app/v1/emails/send",\n` +
         `    headers={"Authorization": "Bearer mb_live_your_key", "Content-Type": "application/json"},\n` +
         `    json={\n` +
         `        "to": "user@example.com",\n` +
@@ -1184,7 +1184,7 @@ CRITICAL RULES:
     else if (qLower.includes('node') || qLower.includes('javascript') || qLower.includes('typescript')) {
       reply = `**Node.js Integration Example (${agentName})**:\n\n` +
         `\`\`\`javascript\n` +
-        `const res = await fetch('https://api.mailindia.in/v1/emails/send', {\n` +
+        `const res = await fetch('https://mail-india-beta.vercel.app/v1/emails/send', {\n` +
         `  method: 'POST',\n` +
         `  headers: {\n` +
         `    'Authorization': 'Bearer mb_live_your_key',\n` +
@@ -1204,7 +1204,7 @@ CRITICAL RULES:
     else if (qLower.includes('php')) {
       reply = `**PHP Integration Example (${agentName})**:\n\n` +
         `\`\`\`php\n` +
-        `$ch = curl_init('https://api.mailindia.in/v1/emails/send');\n` +
+        `$ch = curl_init('https://mail-india-beta.vercel.app/v1/emails/send');\n` +
         `curl_setopt($ch, CURLOPT_HTTPHEADER, [\n` +
         `    'Authorization: Bearer mb_live_your_key',\n` +
         `    'Content-Type: application/json'\n` +
@@ -1224,7 +1224,7 @@ CRITICAL RULES:
       reply = `**Go Integration Example (${agentName})**:\n\n` +
         `\`\`\`go\n` +
         `payload := []byte(\`{"to":"user@example.com","subject":"Alert","html":"<p>Server restored.</p>"}\`)\n` +
-        `req, _ := http.NewRequest("POST", "https://api.mailindia.in/v1/emails/send", bytes.NewBuffer(payload))\n` +
+        `req, _ := http.NewRequest("POST", "https://mail-india-beta.vercel.app/v1/emails/send", bytes.NewBuffer(payload))\n` +
         `req.Header.Set("Authorization", "Bearer mb_live_your_key")\n` +
         `req.Header.Set("Content-Type", "application/json")\n` +
         `resp, err := http.DefaultClient.Do(req)\n` +
