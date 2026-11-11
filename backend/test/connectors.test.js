@@ -252,7 +252,9 @@ test('all 10 email provider connectors configure and decrypt correctly', async (
     assert.equal(stored.host, c.expectedHost);
     assert.equal(stored.port, c.expectedPort);
     assert.equal(stored.username, c.expectedUser);
-    assert.equal(stored.status, 'active');
+    assert.equal(stored.status, 'paused');
+    assert.equal(stored.verifiedAt, null);
+    assert.equal(res.body.status, 'paused');
 
     // Verify credential decryption
     const decrypted = decryptCredentials(encKey, res.body.id, stored.credentials);
@@ -310,10 +312,10 @@ test('multi-connector round-robin sequentially load balances across active sende
     distributedLimiter: async () => true
   });
 
-  // Admin registers 4 active sender accounts: Gmail 1, Gmail 2, Brevo, SendGrid
+  // Admin registers 4 sender accounts: Gmail 1, Gmail 2, Brevo, SendGrid.
   const accounts = [
-    { email: 'account1@gmail.com', name: 'Sender Alpha', provider: 'gmail', authType: 'app_password', password: 'passone' },
-    { email: 'account2@gmail.com', name: 'Sender Beta', provider: 'gmail', authType: 'app_password', password: 'passtwo' },
+    { email: 'account1@gmail.com', name: 'Sender Alpha', provider: 'gmail', authType: 'app_password', password: 'abcd efgh ijkl mnop' },
+    { email: 'account2@gmail.com', name: 'Sender Beta', provider: 'gmail', authType: 'app_password', password: 'qrst uvwx yzab cdef' },
     { email: 'account3@brevo.com', name: 'Sender Gamma (Brevo)', provider: 'brevo', authType: 'custom_smtp', password: 'passthree' },
     { email: 'account4@sendgrid.com', name: 'Sender Delta (SendGrid)', provider: 'sendgrid', authType: 'custom_smtp', password: 'passfour' }
   ];
@@ -325,6 +327,10 @@ test('multi-connector round-robin sequentially load balances across active sende
       .set('Authorization', 'Bearer admin')
       .send(a);
     assert.equal(res.status, 201);
+    assert.equal(db.root.sender_accounts[res.body.id].status, 'paused');
+    // This test exercises dispatch rotation only. SMTP handshake and activation
+    // are covered with injected transports in sender-lifecycle.test.js.
+    await db.ref('sender_accounts/' + res.body.id).update({ status: 'active', verifiedAt: Date.now() });
     senderIds.push(res.body.id);
   }
 

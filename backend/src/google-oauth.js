@@ -14,6 +14,7 @@ const getCookies = req => {
 function createGoogleOAuthRoutes({
   db,
   auth,
+  authenticate,
   encryptionKey,
   cookieOptions = { httpOnly: true, secure: true, sameSite: 'lax', path: '/' }
 }) {
@@ -205,8 +206,11 @@ function createGoogleOAuthRoutes({
       });
       const googleUser = await userinfoResponse.json();
 
-      if (!googleUser.email || !googleUser.id) {
+      if (!userinfoResponse.ok || !googleUser.email || !googleUser.id) {
         throw new Error('Google did not return a valid user profile.');
+      }
+      if (googleUser.verified_email !== true) {
+        throw new Error('Verify your email address with Google before signing in.');
       }
 
       const userEmail = googleUser.email.toLowerCase().trim();
@@ -387,7 +391,12 @@ function createGoogleOAuthRoutes({
       if (token) {
         let decoded = await auth.verifySessionCookie(token, true).catch(() => null);
         if (!decoded) decoded = await auth.verifyIdToken(token, true).catch(() => null);
-        if (decoded && decoded.uid) uid = decoded.uid;
+        if (decoded && decoded.uid) {
+          if (decoded.email_verified !== true) {
+            return res.redirect(clientRedirect('/account.html?error=' + encodeURIComponent('Verify your email address before connecting Gmail.'), req));
+          }
+          uid = decoded.uid;
+        }
       }
     } catch {}
 
@@ -536,9 +545,10 @@ function createGoogleOAuthRoutes({
   // -------------------------------------------------------------
 
   // Middleware helper to extract authenticated user from session cookie or Bearer token
-  const authenticateUser = async (req, res, next) => {
+  const authenticateUser = authenticate || (async (req, res, next) => {
     let uid = null;
     let email = null;
+    let emailVerified = false;
 
     try {
       const jar = getCookies(req);
@@ -548,6 +558,7 @@ function createGoogleOAuthRoutes({
         if (decoded && decoded.uid) {
           uid = decoded.uid;
           email = decoded.email;
+          emailVerified = decoded.email_verified === true;
         }
       }
     } catch {}
@@ -564,6 +575,7 @@ function createGoogleOAuthRoutes({
           if (decoded && decoded.uid) {
             uid = decoded.uid;
             email = decoded.email;
+            emailVerified = decoded.email_verified === true;
           }
         } catch {}
       }
@@ -572,10 +584,13 @@ function createGoogleOAuthRoutes({
     if (!uid) {
       return res.status(401).json({ success: false, error: 'UNAUTHENTICATED', message: 'Authentication required.' });
     }
+    if (!emailVerified) {
+      return res.status(403).json({ success: false, error: 'EMAIL_NOT_VERIFIED', message: 'Verify your email address before accessing Gmail features.' });
+    }
 
-    req.user = { uid, email };
+    req.user = { uid, email, email_verified: true };
     next();
-  };
+  });
 
   // GET /api/gmail/status
   router.get('/api/gmail/status', authenticateUser, async (req, res) => {

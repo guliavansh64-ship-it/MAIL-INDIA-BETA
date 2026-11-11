@@ -2,47 +2,47 @@
 const path = require('node:path');
 require('dotenv').config({ path: path.join(__dirname, '../../.env') });
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
+require('dotenv').config({ path: path.join(__dirname, '../../../.env') });
 require('dotenv').config();
 const { createApp } = require('./app');
 const { createRateLimiter } = require('./limiter');
 const { autoRecoverStuckJobs } = require('./recovery');
-const { createLocalDatabase, createLocalAuth } = require('./local-dev');
-const { createFirebaseDatabase, createFirebaseAuth } = require('./firebase-sync');
+const { createFirebaseAuth } = require('./firebase-sync');
+const { createFirebaseAdminRuntime } = require('./firebase-admin-runtime');
 
-let auth = null;
-let db = null;
-let isDev = false;
+const fbDatabaseUrl = process.env.FIREBASE_DATABASE_URL || '';
+const fbProjectId = process.env.FIREBASE_PROJECT_ID || '';
+const fbApiKey = process.env.FIREBASE_WEB_API_KEY || '';
+const sessionSecret = process.env.SESSION_SECRET;
+const runtime = createFirebaseAdminRuntime({
+  projectId: fbProjectId,
+  databaseURL: fbDatabaseUrl,
+  credentialPath: process.env.GOOGLE_APPLICATION_CREDENTIALS
+});
 
-const fbDatabaseUrl = process.env.FIREBASE_DATABASE_URL || 'https://to-375ee-default-rtdb.firebaseio.com';
-const fbProjectId = process.env.FIREBASE_PROJECT_ID || 'to-375ee';
-const fbApiKey = process.env.FIREBASE_WEB_API_KEY || 'AIzaSyCvfIXHa_6Vy5Qh2Of-ayhUjw1INwujmsE';
+// REST-based Firebase database fallback (no service account needed)
+const { createFirebaseDatabase } = require('./firebase-sync');
+const restDb = fbDatabaseUrl ? createFirebaseDatabase({ databaseUrl: fbDatabaseUrl }) : null;
 
-if (fbDatabaseUrl && fbProjectId) {
-  try {
-    db = createFirebaseDatabase({
-      databaseUrl: fbDatabaseUrl
-    });
-    auth = createFirebaseAuth({
-      projectId: fbProjectId,
-      apiKey: fbApiKey,
-      db,
-      sessionSecret: process.env.SESSION_SECRET || 'mailbridge-session-secure-secret-key-375ee'
-    });
-    isDev = false;
-    console.log(`[FIREBASE] Connected to Firebase Project: ${fbProjectId}`);
-    console.log(`[FIREBASE] Realtime Database: ${fbDatabaseUrl}`);
-    console.log(`[FIREBASE] Live data synchronization active. No demo data loaded.`);
-  } catch (err) {
-    console.warn(`[FIREBASE] Firebase initialization failed (${err.message}). Starting in fallback mode.`);
+// Database proxy: uses Admin SDK when connected, REST API otherwise
+const db = {
+  ref(referencePath = '') {
+    if (runtime.getStatus().database.state === 'connected') {
+      return runtime.db.ref(referencePath);
+    }
+    if (restDb) return restDb.ref(referencePath);
+    return runtime.db.ref(referencePath);
   }
-}
+};
 
-if (!auth || !db) {
-  isDev = true;
-  console.log('[DEV MODE] Firebase credentials not configured. Starting in Standalone Local Mode.');
-  db = createLocalDatabase();
-  auth = createLocalAuth();
-}
+const auth = createFirebaseAuth({ projectId: fbProjectId, db, sessionSecret, adminAuth: runtime.adminAuth });
+const connectionStatus = () => {
+  const status = runtime.getStatus();
+  if (!sessionSecret) {
+    status.authentication = { ...status.authentication, state: 'unavailable', configured: false, reason: 'MISSING_SESSION_SECRET' };
+  }
+  return status;
+};
 
 let queue = null, limiter = null, connection = null;
 
@@ -58,20 +58,25 @@ if (process.env.REDIS_URL) {
 
 const encryptionKey = (process.env.SENDER_ENCRYPTION_KEY && Buffer.from(process.env.SENDER_ENCRYPTION_KEY, 'base64').length === 32)
   ? process.env.SENDER_ENCRYPTION_KEY
-  : require('node:crypto').createHash('sha256').update(process.env.SESSION_SECRET || 'mailbridge-master-session-salt-375ee').digest('base64');
+  : sessionSecret ? require('node:crypto').createHash('sha256').update(sessionSecret).digest('base64') : null;
 
-if (process.env.ENABLE_EXPERIMENTAL_SENDING !== 'false') {
+const sendingEnabled = process.env.ENABLE_EXPERIMENTAL_SENDING !== 'false' && Boolean(encryptionKey);
+if (sendingEnabled) {
   if (process.env.REDIS_URL && connection) {
     try {
       const { Queue, Worker } = require('bullmq');
       const { runJob } = require('./sending');
       queue = new Queue('mailbridge-send', { connection });
-      const worker = new Worker('mailbridge-send', async j => runJob({
-        db,
-        key: encryptionKey,
-        uid: j.data.uid,
-        id: j.data.id
-      }), { connection, concurrency: 2 });
+      const worker = new Worker('mailbridge-send', async j => {
+        await runtime.ready();
+        if (runtime.getStatus().database.state !== 'connected' && !restDb) throw new Error('DATABASE_UNAVAILABLE');
+        return runJob({
+          db,
+          key: encryptionKey,
+          uid: j.data.uid,
+          id: j.data.id
+        });
+      }, { connection, concurrency: 2 });
 
       worker.on('failed', () => console.error('Email job failed; manual reconciliation may be required.'));
       worker.on('error', () => console.error('Email worker error'));
@@ -85,6 +90,8 @@ if (process.env.ENABLE_EXPERIMENTAL_SENDING !== 'false') {
     const { runJob } = require('./sending');
     queue = {
       async add(name, data, options) {
+        await runtime.ready();
+        if (runtime.getStatus().database.state !== 'connected' && !restDb) throw new Error('DATABASE_UNAVAILABLE');
         setImmediate(async () => {
           try {
             await runJob({
@@ -105,6 +112,7 @@ if (process.env.ENABLE_EXPERIMENTAL_SENDING !== 'false') {
 
   // Periodic automatic stuck job recovery runner
   const recoveryInterval = setInterval(() => {
+    if (runtime.getStatus().database.state !== 'connected' && !restDb) return;
     autoRecoverStuckJobs(db).catch(err => console.error('Auto recovery error:', err.message));
   }, 60000);
   if (recoveryInterval.unref) recoveryInterval.unref();
@@ -113,25 +121,23 @@ if (process.env.ENABLE_EXPERIMENTAL_SENDING !== 'false') {
 const app = createApp({
   auth,
   db,
+  connectionStatus,
   origins: (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean),
   publicConfig: {
-    firebaseApiKey: process.env.FIREBASE_WEB_API_KEY || 'AIzaSyCvfIXHa_6Vy5Qh2Of-ayhUjw1INwujmsE',
-    firebaseProjectId: process.env.FIREBASE_PROJECT_ID || 'to-375ee',
-    firebaseAuthDomain: process.env.FIREBASE_AUTH_DOMAIN || 'to-375ee.firebaseapp.com',
-    firebaseDatabaseUrl: process.env.FIREBASE_DATABASE_URL || 'https://to-375ee-default-rtdb.firebaseio.com',
-    firebaseStorageBucket: process.env.FIREBASE_STORAGE_BUCKET || 'to-375ee.firebasestorage.app',
-    firebaseMessagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || '555488380029',
-    firebaseAppId: process.env.FIREBASE_APP_ID || '1:555488380029:web:588046ca97420a868d5d14',
+    firebaseApiKey: fbApiKey,
+    firebaseProjectId: fbProjectId,
+    firebaseAuthDomain: process.env.FIREBASE_AUTH_DOMAIN || (fbProjectId ? fbProjectId + '.firebaseapp.com' : ''),
+    firebaseDatabaseUrl: fbDatabaseUrl,
     firebaseConfig: {
-      apiKey: process.env.FIREBASE_WEB_API_KEY || 'AIzaSyCvfIXHa_6Vy5Qh2Of-ayhUjw1INwujmsE',
-      authDomain: process.env.FIREBASE_AUTH_DOMAIN || 'to-375ee.firebaseapp.com',
-      databaseURL: process.env.FIREBASE_DATABASE_URL || 'https://to-375ee-default-rtdb.firebaseio.com',
-      projectId: process.env.FIREBASE_PROJECT_ID || 'to-375ee',
-      storageBucket: process.env.FIREBASE_STORAGE_BUCKET || 'to-375ee.firebasestorage.app',
-      messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || '555488380029',
-      appId: process.env.FIREBASE_APP_ID || '1:555488380029:web:588046ca97420a868d5d14'
+      apiKey: fbApiKey,
+      authDomain: process.env.FIREBASE_AUTH_DOMAIN || (fbProjectId ? fbProjectId + '.firebaseapp.com' : ''),
+      databaseURL: fbDatabaseUrl,
+      projectId: fbProjectId,
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET || '',
+      messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || '',
+      appId: process.env.FIREBASE_APP_ID || ''
     },
-    devMode: isDev
+    devMode: false
   },
   paymentConfig: {
     enabled: process.env.ENABLE_EXPERIMENTAL_PAYMENTS === 'true',
@@ -144,10 +150,8 @@ const app = createApp({
     baseUrl: process.env.ZETPAY_BASE_URL || 'https://zetpay-beta.vercel.app'
   },
   sendingConfig: {
-    enabled: process.env.ENABLE_EXPERIMENTAL_SENDING !== 'false',
-    encryptionKey: (process.env.SENDER_ENCRYPTION_KEY && Buffer.from(process.env.SENDER_ENCRYPTION_KEY, 'base64').length === 32)
-      ? process.env.SENDER_ENCRYPTION_KEY
-      : require('node:crypto').createHash('sha256').update(process.env.SESSION_SECRET || 'mailbridge-master-session-salt-375ee').digest('base64')
+    enabled: sendingEnabled,
+    encryptionKey
   },
   sendQueue: queue,
   distributedLimiter: limiter
@@ -156,22 +160,21 @@ const app = createApp({
 let server = null;
 if (require.main === module) {
   const port = Number(process.env.PORT) || 3000;
-  server = app.listen(port, '0.0.0.0', async () => {
-    if (db && typeof db.ready === 'function') {
-      await db.ready();
-    }
-    console.log(`=================================================`);
-    console.log(`MailBridge (Mail India) Server listening on ${port}`);
-    console.log(`Dashboard URL:  http://localhost:${port}`);
-    console.log(`Health Check:   http://localhost:${port}/api/health`);
-    console.log(`Firebase:       CONNECTED (${process.env.FIREBASE_PROJECT_ID || 'to-375ee'})`);
-    console.log(`RTDB Sync:      ACTIVE (${process.env.FIREBASE_DATABASE_URL || 'https://to-375ee-default-rtdb.firebaseio.com'})`);
-    console.log(`Demo Data:      DISABLED (Live Firebase Data Only)`);
-    console.log(`ZetPay UPI:     CONNECTED (Key: ${process.env.ZETPAY_API_KEY || 'ZPPCCkPtfAH7EC78UMNT8kUqm7q5XdjNRSX'})`);
-    console.log(`=================================================`);
+  server = app.listen(port, '0.0.0.0', () => {
+    console.log('MailBridge (Mail India) listening at http://localhost:' + port);
+    console.log('Connection status: http://localhost:' + port + '/api/health');
+    runtime.ready().then(() => {
+      const status = connectionStatus();
+      console.log('[FIREBASE DATABASE]', status.database.state, status.database.reason || '');
+      console.log('[FIREBASE AUTH]', status.authentication.state, status.authentication.reason || '');
+      if (status.database.state !== 'connected' && restDb) {
+        console.log('[DATABASE FALLBACK] Using REST-based Firebase database (no service account)');
+      }
+    });
   });
 }
 
 app.app = app;
 app.server = server;
+app.firebaseRuntime = runtime;
 module.exports = app;

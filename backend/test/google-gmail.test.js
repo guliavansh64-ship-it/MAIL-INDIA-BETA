@@ -238,7 +238,7 @@ test('GET /oauth/google/callback validates state, provisions user, grants 10 cre
       return {
         ok: true,
         json: async () => ({
-          id: '123456789',
+          id: '123456789', verified_email: true,
           email: 'newuser@gmail.com',
           name: 'New Google User',
           picture: 'https://lh3.googleusercontent.com/photo.jpg'
@@ -423,7 +423,8 @@ test('GET /api/gmail/status and POST /api/gmail/disconnect manage connection lif
   // User A disconnects Gmail
   const discRes = await request(app)
     .post('/api/gmail/disconnect')
-    .set('Cookie', 'mb_session=session_userA');
+    .set('Cookie', 'mb_session=session_userA; mb_csrf=' + 'a'.repeat(64))
+    .set('X-CSRF-Token', 'a'.repeat(64));
   assert.equal(discRes.status, 200);
   assert.equal(discRes.body.success, true);
 
@@ -472,7 +473,8 @@ test('POST /api/gmail/send-test dispatches email via Gmail API and records sendi
   try {
     const res = await request(app)
       .post('/api/gmail/send-test')
-      .set('Cookie', 'mb_session=session_userA')
+      .set('Cookie', 'mb_session=session_userA; mb_csrf=' + 'a'.repeat(64))
+      .set('X-CSRF-Token', 'a'.repeat(64))
       .send({
         to: 'target@example.com',
         subject: 'Live Test Subject',
@@ -589,7 +591,7 @@ test('Exact Google Cloud Console registered redirect URIs /oauth/oauth/* routes 
     if (s.includes('googleapis.com/oauth2/v2/userinfo')) {
       return {
         ok: true,
-        json: async () => ({ id: '987654321', email: 'registered.callback@gmail.com', name: 'Registered User' })
+        json: async () => ({ id: '987654321', verified_email: true, email: 'registered.callback@gmail.com', name: 'Registered User' })
       };
     }
     throw new Error('unexpected: ' + s);

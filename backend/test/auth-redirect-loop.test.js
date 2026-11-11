@@ -17,8 +17,8 @@ test('Comprehensive Auth Flow Verification (9 Scenarios)', async (t) => {
   const encKey = crypto.randomBytes(32).toString('base64');
   const app = createApp({ db, auth, sendingConfig: { encryptionKey: encKey } });
 
-  let googleUserA = { id: 'usr-11111', email: 'userA.google@gmail.com', name: 'User Alpha' };
-  let googleUserB = { id: 'usr-22222', email: 'userB.google@gmail.com', name: 'User Beta' };
+  let googleUserA = { id: 'usr-11111', verified_email: true, email: 'userA.google@gmail.com', name: 'User Alpha' };
+  let googleUserB = { id: 'usr-22222', verified_email: true, email: 'userB.google@gmail.com', name: 'User Beta' };
   let currentGoogleMock = googleUserA;
 
   const originalFetch = globalThis.fetch;

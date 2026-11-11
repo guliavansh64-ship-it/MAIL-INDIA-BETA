@@ -37,7 +37,7 @@ const {
   purgeUserData
 } = require('./retention');
 
-function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, sendQueue = null, distributedLimiter = null }) {
+function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, sendQueue = null, distributedLimiter = null, smtpFactory = transport }) {
   const r = express.Router();
   const encKey = (key && typeof key === 'string' && Buffer.from(key, 'base64').length === 32)
     ? key
@@ -348,6 +348,7 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
           port: v.port || 465,
           username: v.username || v.email,
           status: v.status,
+          verifiedAt: v.verifiedAt || null,
           dailyLimit: v.dailyLimit,
           usage: v.usage || {},
           createdAt: v.createdAt
@@ -382,7 +383,7 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
     }
 
     const cleanPassword = typeof password === 'string'
-      ? (pKey === 'app_password' || rawAuthType === 'app_password' ? password.replace(/\s+/g, '') : password.trim())
+      ? (pKey === 'app_password' || pKey === 'gmail' || rawAuthType === 'app_password' ? password.replace(/\s+/g, '') : password.trim())
       : '';
 
     // Determine normalized provider settings
@@ -477,6 +478,9 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
     if ((normalizedAuthType === 'app_password' || normalizedAuthType === 'custom_smtp') && !cleanPassword) {
       return res.status(400).json({ error: 'PASSWORD_REQUIRED', message: 'Password or API Key is required.' });
     }
+    if (normalizedAuthType === 'app_password' && !/^[a-z]{16}$/i.test(cleanPassword)) {
+      return res.status(400).json({ error: 'GMAIL_APP_PASSWORD_INVALID', message: 'Enter the 16-letter app password from your Google Account. Spaces are removed automatically.' });
+    }
     if (normalizedAuthType === 'oauth2' && (!clientId || !clientSecret || !refreshToken)) {
       return res.status(400).json({ error: 'OAUTH_REQUIRED', message: 'Client ID, Client Secret, and Refresh Token are required.' });
     }
@@ -497,12 +501,14 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
         username: effectiveUser || email.toLowerCase(),
         credentials,
         dailyLimit: effectiveLimit,
-        status: 'active',
+        status: 'paused',
+        verifiedAt: null,
+        usage: existingEntry ? (existingEntry[1].usage || {}) : {},
         createdAt: existingEntry ? (existingEntry[1].createdAt || Date.now()) : Date.now(),
         updatedAt: Date.now()
       });
       await audit(req.user.uid, existingEntry ? 'sender.updated' : 'sender.created', id);
-      res.status(201).json({ success: true, id, status: 'active', provider: providerName, updated: Boolean(existingEntry) });
+      res.status(201).json({ success: true, id, status: 'paused', verifiedAt: null, provider: providerName, updated: Boolean(existingEntry), message: 'Sender saved. Use Verify SMTP to check the credentials and activate it.' });
     } catch (err) {
       console.error('[ADMIN SENDER ERROR]', err);
       return res.status(500).json({ error: 'SENDER_CREATE_FAILED', message: err.message });
@@ -525,16 +531,38 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
 
   r.post('/senders/:id/verify', async (req, res) => {
     if (!safeId(req.params.id)) return res.status(400).json({ error: 'INVALID_REQUEST' });
+    let client;
+    let phase = 'database';
     try {
       const s = (await db.ref('sender_accounts/' + req.params.id).get()).val();
       if (!s) return res.status(404).json({ error: 'NOT_FOUND' });
       const { decryptCredentials } = require('./sending');
-      await transport(s.email, decryptCredentials(encKey, req.params.id, s.credentials)).verify();
+      let secret;
+      try { secret = decryptCredentials(encKey, req.params.id, s.credentials); }
+      catch { return res.status(503).json({ error: 'SENDER_DECRYPTION_FAILED', message: 'The saved credentials cannot be opened. Restore the original sender encryption key or save the credentials again.' }); }
+      if (secret.type === 'app_password' && !/^[a-z]{16}$/i.test(String(secret.password || '').replace(/\s+/g, ''))) {
+        return res.status(400).json({ error: 'GMAIL_APP_PASSWORD_INVALID', message: 'Save a valid 16-letter Gmail app password before verifying SMTP.' });
+      }
+      if (secret.type === 'app_password') secret.password = secret.password.replace(/\s+/g, '');
+      phase = 'smtp';
+      client = smtpFactory(s.email, secret);
+      await client.verify();
+      phase = 'database';
+      const verifiedAt = Date.now();
+      const verified = await db.ref('sender_accounts/' + req.params.id).transaction(current => {
+        if (current === null) return null;
+        if (!current || current.credentials?.ciphertext !== s.credentials?.ciphertext) return;
+        return { ...current, status: 'active', verifiedAt, updatedAt: verifiedAt };
+      }, undefined, false);
+      if (!verified.committed) return res.status(409).json({ error: 'SENDER_CHANGED', message: 'The sender configuration changed during verification. Please verify it again.' });
       await audit(req.user.uid, 'sender.verified', req.params.id);
-      res.json({ success: true });
+      res.json({ success: true, status: 'active', verifiedAt, message: 'SMTP credentials verified. The sender is active.' });
     } catch (err) {
-      return res.status(502).json({ error: 'SENDER_VERIFICATION_FAILED', message: err.message || 'Unable to verify sender connection.' });
-    }
+      if (phase === 'database') return res.status(503).json({ error: 'DATABASE_UNAVAILABLE', message: 'Could not read or update the sender in Realtime Database.' });
+      const { smtpError } = require('./system-mail');
+      const safeError = smtpError(err, 'verify');
+      return res.status(safeError.status).json({ error: safeError.code, message: safeError.message });
+    } finally { try { client?.close?.(); } catch {} }
   });
 
   r.post('/senders/:id/status', async (req, res) => {
@@ -545,6 +573,9 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
       const ref = db.ref('sender_accounts/' + req.params.id);
       const s = (await ref.get()).val();
       if (!s) return res.status(404).json({ error: 'NOT_FOUND' });
+      if (req.body.status === 'active' && (!Number.isFinite(s.verifiedAt) || s.verifiedAt <= 0)) {
+        return res.status(409).json({ error: 'SENDER_NOT_VERIFIED', message: 'Use Verify SMTP to check the credentials before activating this sender.' });
+      }
       await ref.child('status').set(req.body.status);
       await audit(req.user.uid, 'sender.' + req.body.status, req.params.id);
       res.json({ success: true });
@@ -559,7 +590,7 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
     try {
       const [u, s] = await Promise.all([db.ref('users/' + uid).get(), db.ref('sender_accounts/' + senderId).get()]);
       if (!u.val() || !s.val()) return res.status(404).json({ error: 'NOT_FOUND' });
-      await db.ref('sender_assignments/' + uid).set({ senderId, assignedAt: Date.now() });
+      await db.ref('sender_assignments/' + uid).set({ senderId, manual: true, assignedAt: Date.now() });
       await audit(req.user.uid, 'sender.assigned', uid, { senderId });
       res.json({ success: true });
     } catch {

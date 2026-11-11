@@ -105,6 +105,7 @@ async function senderAttempt(db,senderId,day){
   let ok=false;
   let r=await ref.transaction(s=>{
     ok=false;
+    if(s===null)return null;
     if(!s||s.status!=='active'||!Number.isSafeInteger(s.dailyLimit)||s.dailyLimit<1)return;
     s.usage=s.usage||{};
     let n=s.usage[day]||0;
@@ -125,9 +126,18 @@ async function runJob({db,key,uid,id,send=async(s,m,secret)=>transport(s.email,s
   if(!user||user.status!=='active'){await transition(db,uid,id,['processing'],'failed',{error:'USER_SUSPENDED'});return}
   if((await db.ref('suppression_list/'+sha(job.message.to)).get()).val()){await transition(db,uid,id,['processing'],'failed',{error:'RECIPIENT_SUPPRESSED'});return}
 
-  // 1. Dispatch via user-connected Gmail API if available
-  const gmailConnSnap = await db.ref(`gmail_connections/${uid}`).get();
-  const gmailConn = gmailConnSnap.val();
+  // An explicit administrator assignment keeps the selected From account,
+  // including when this user also connected a separate Gmail OAuth account.
+  const assignment = (await db.ref(`sender_assignments/${uid}`).get()).val();
+  const hasTenantPin = assignment?.manual === true && safeId(assignment.senderId);
+  const systemSenderId = String(process.env.SYSTEM_SENDER_ID || '').trim();
+  const pinnedSenderId = hasTenantPin ? assignment.senderId : systemSenderId;
+  const isPinnedSender = Boolean(pinnedSenderId);
+  if (isPinnedSender && (!safeId(pinnedSenderId) || pinnedSenderId !== job.senderId)) {
+    await transition(db, uid, id, ['processing'], 'failed', { error: 'SENDER_UNAVAILABLE' });
+    return;
+  }
+  const gmailConn = isPinnedSender ? null : (await db.ref(`gmail_connections/${uid}`).get()).val();
   if (gmailConn && gmailConn.status === 'active' && gmailConn.encryptedRefreshToken) {
     try {
       const { sendViaConnectedGmail } = require('./gmail-api');
@@ -165,12 +175,12 @@ async function runJob({db,key,uid,id,send=async(s,m,secret)=>transport(s.email,s
     }
   }
 
-  let assignment=(await db.ref(`sender_assignments/${uid}`).get()).val();
   let senderId=job.senderId;
   if(!safeId(senderId)){await transition(db,uid,id,['processing'],'failed',{error:'SENDER_UNAVAILABLE'});return}
   if(assignment?.manual && assignment?.senderId && assignment.senderId!==senderId){await transition(db,uid,id,['processing'],'failed',{error:'SENDER_UNAVAILABLE'});return}
   let sender=(await db.ref('sender_accounts/'+senderId).get()).val();
   if(!sender||sender.status!=='active'){
+    if (isPinnedSender) { await transition(db,uid,id,['processing'],'failed',{error:'SENDER_UNAVAILABLE'}); return; }
     const sendersSnap = await db.ref('sender_accounts').get();
     const active = Object.entries(sendersSnap.val() || {}).find(([_, s]) => s && s.status === 'active');
     if (active) {

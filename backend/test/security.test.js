@@ -121,7 +121,7 @@ test('CSRF protection blocks cookie requests missing valid CSRF token', async ()
   const sessionAuth = {
     ...auth,
     async verifySessionCookie(cookie) {
-      if (cookie === 'valid_cookie') return { uid: 'user_a', email: 'a@example.com' };
+      if (cookie === 'valid_cookie') return { uid: 'user_a', email: 'a@example.com', email_verified: true };
       throw Error('invalid');
     }
   };

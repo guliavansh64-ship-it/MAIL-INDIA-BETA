@@ -5,21 +5,28 @@ const cors = require('cors');
 const { rateLimit } = require('express-rate-limit');
 const crypto = require('node:crypto');
 const path = require('node:path');
+const fs = require('node:fs');
 const { createPaymentRoutes, razorpayProvider } = require('./payments');
 const { createZetpayRoutes, zetpayProvider: defaultZetpayProvider } = require('./zetpay');
 const { adminRoutes } = require('./admin');
 const { createGoogleOAuthRoutes } = require('./google-oauth');
-const { normalize, reserve, safeId, sha, validEmail, decryptCredentials, transport } = require('./sending');
+const { normalize, reserve, safeId, sha, validEmail } = require('./sending');
 const { visibleLogs } = require('./logs');
 const { purgeUserData } = require('./retention');
 const { handleDeliveryEvent } = require('./bounces');
+const { createSystemMailer, SystemMailError } = require('./system-mail');
 
 const hashKey = key => crypto.createHash('sha256').update(key).digest('hex');
 const validKey = key => /^mb_live_[A-Za-z0-9_-]{43}$/.test(key);
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
-function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = {}, paymentProvider, zetpayConfig = {}, zetpayProviderInstance, sendingConfig = {}, sendQueue = null, distributedLimiter = null }) {
+function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = {}, paymentProvider, zetpayConfig = {}, zetpayProviderInstance, sendingConfig = {}, sendQueue = null, distributedLimiter = null, connectionStatus = null, systemMailer = null }) {
   const app = express();
+  const accountMailer = systemMailer || createSystemMailer({
+    db, auth, encryptionKey: sendingConfig.encryptionKey,
+    senderId: sendingConfig.systemSenderId || process.env.SYSTEM_SENDER_ID || '',
+    smtpFactory: sendingConfig.smtpFactory
+  });
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
   app.use(helmet({
@@ -96,7 +103,10 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
   );
   const equalCsrf = (a, b) => typeof a === 'string' && typeof b === 'string' && /^[a-f0-9]{64}$/.test(a) && /^[a-f0-9]{64}$/.test(b) && crypto.timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
 
-  const firebaseAuth = wrap(async (req, res, next) => {
+  const authenticateFirebase = ({ allowUnverified = false } = {}) => wrap(async (req, res, next) => {
+    if (typeof connectionStatus === 'function' && !['ready', 'connected'].includes(connectionStatus().authentication?.state)) {
+      return fail(res, 503, 'AUTH_UNAVAILABLE', 'Firebase Admin is not connected. Check the backend service-account configuration.');
+    }
     const m = /^Bearer (\S+)$/.exec(req.get('authorization') || '');
     const jar = cookies(req);
     try {
@@ -125,6 +135,9 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
           try {
             req.user = await auth.verifySessionCookie(sessionToken, true);
             req.authMethod = 'cookie';
+            if (!allowUnverified && req.user.email_verified !== true) {
+              return fail(res, 403, 'EMAIL_NOT_VERIFIED', 'Verify your email address before accessing your account.');
+            }
             const clientCsrf = jar['__Host-mb_csrf'] || jar['mb_csrf'];
             if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && !equalCsrf(clientCsrf, req.get('x-csrf-token'))) {
               return fail(res, 403, 'CSRF_FAILED', 'Invalid CSRF token.');
@@ -142,8 +155,13 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
     } catch {
       return fail(res, 401, 'UNAUTHENTICATED', 'Invalid or expired session.');
     }
+    if (!allowUnverified && req.user.email_verified !== true) {
+      return fail(res, 403, 'EMAIL_NOT_VERIFIED', 'Verify your email address before accessing your account.');
+    }
     next();
   });
+  const firebaseAuth = authenticateFirebase();
+  const onboardingAuth = authenticateFirebase({ allowUnverified: true });
 
   const apiAuth = wrap(async (req, res, next) => {
     const m = /^Bearer (\S+)$/.exec(req.get('authorization') || '');
@@ -152,6 +170,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
     if (!entry || entry.status !== 'active') return fail(res, 401, 'INVALID_API_KEY', 'Invalid API key.');
     const userProfile = (await db.ref('users/' + entry.uid).get()).val();
     if (!userProfile || userProfile.status !== 'active') return fail(res, 403, 'USER_SUSPENDED', 'Account is unavailable.');
+    if (userProfile.emailVerified !== true) return fail(res, 403, 'EMAIL_NOT_VERIFIED', 'Verify your email address before using the API.');
 
     if (distributedLimiter) {
       try {
@@ -255,23 +274,30 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
     res.json({ success: true, announcements: items });
   }));
 
-  app.get('/api/health', (req, res) => res.json({
-    status: 'ok',
-    sending: sendingConfig.enabled && sendQueue ? 'active' : 'disabled',
-    payments: zetProvider ? 'connected' : (paymentConfig.enabled && paymentConfig.keyId?.startsWith('rzp_test_') ? 'test_mode' : 'disabled'),
-    zetpay: zetProvider ? 'connected' : 'disabled'
-  }));
+  app.get('/api/health', (req, res) => {
+    const connections = typeof connectionStatus === 'function' ? connectionStatus() : null;
+    const databaseReady = !connections || ['ready', 'connected'].includes(connections.database?.state);
+    const authReady = !connections || ['ready', 'connected'].includes(connections.authentication?.state);
+    res.status(databaseReady && authReady ? 200 : 503).json({
+      status: databaseReady && authReady ? 'ok' : 'degraded',
+      ...(connections || {}),
+      sending: !databaseReady ? 'unavailable' : (sendingConfig.enabled && sendQueue ? 'active' : 'disabled'),
+      payments: zetProvider ? 'configured' : (paymentConfig.enabled && paymentConfig.keyId?.startsWith('rzp_test_') ? 'test_mode' : 'disabled'),
+      zetpay: zetProvider ? 'configured' : 'disabled'
+    });
+  });
 
   // Profile creation uses a transaction, ensuring repeated sign-ins cannot reset a user's state.
-  app.post('/api/session/bootstrap', firebaseAuth, wrap(async (req, res) => {
+  app.post('/api/session/bootstrap', onboardingAuth, wrap(async (req, res) => {
     if (!req.user.email) return fail(res, 400, 'INVALID_ACCOUNT', 'An email address is required.');
     const adminEmails = (process.env.ADMIN_EMAILS || 'guliavansh64@gmail.com').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
     const userEmail = (req.user.email || '').toLowerCase();
     const isGmail = userEmail.endsWith('@gmail.com');
     // Only guliavansh64@gmail.com is allowed admin among Gmail accounts
-    const isExplicitAdmin = isGmail
+    const emailVerified = req.user.email_verified === true;
+    const isExplicitAdmin = emailVerified && (isGmail
       ? (userEmail === 'guliavansh64@gmail.com')
-      : Boolean(req.user.admin || adminEmails.includes(userEmail));
+      : Boolean(req.user.admin || adminEmails.includes(userEmail)));
 
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : (req.user.name || '');
     const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
@@ -280,15 +306,18 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
     const ref = profile(req.user.uid);
     const result = await ref.transaction(existing => {
       if (existing) {
+        existing.email = req.user.email;
+        existing.emailVerified = emailVerified;
         if (name && !existing.name) existing.name = name;
         if (username && !existing.username) existing.username = username;
         if (mobile && !existing.mobile) existing.mobile = mobile;
-        if (isGmail && userEmail !== 'guliavansh64@gmail.com') existing.admin = false;
+        if (!emailVerified || (isGmail && userEmail !== 'guliavansh64@gmail.com')) existing.admin = false;
         else if (isExplicitAdmin) existing.admin = true;
         return existing;
       }
       const doc = {
         email: req.user.email,
+        emailVerified,
         name: name || '',
         username: username || '',
         mobile: mobile || '',
@@ -302,11 +331,19 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
     const data = result.snapshot.val();
     if (data.status !== 'active') return fail(res, 403, 'USER_SUSPENDED', 'Account is unavailable.');
 
+    // Maintain a hashed email -> uid index so /api/auth/account-exists can answer
+    // "is this email already registered?" without scanning the whole users node
+    // or leaking raw addresses as database keys.
+    try {
+      const emailHash = crypto.createHash('sha256').update(userEmail).digest('hex');
+      await db.ref('email_index/' + emailHash).set({ uid: req.user.uid, createdAt: Date.now() });
+    } catch {}
+
     // Ensure wallet exists in Firebase RTDB
     const walletRef = db.ref('wallets/' + req.user.uid);
     const walletSnap = await walletRef.get();
     const val = walletSnap.val ? walletSnap.val() : null;
-    if (val === null || val === undefined) {
+    if (emailVerified && (val === null || val === undefined)) {
       await walletRef.set({
         balance: isExplicitAdmin ? 10000 : 0,
         purchased: isExplicitAdmin ? 10000 : 0,
@@ -315,7 +352,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
       });
     }
 
-    const userIsAdmin = isGmail ? (userEmail === 'guliavansh64@gmail.com') : Boolean(data.admin);
+    const userIsAdmin = emailVerified && (isGmail ? (userEmail === 'guliavansh64@gmail.com') : Boolean(data.admin));
     res.json({ success: true, user: { uid: req.user.uid, email: data.email, name: data.name, username: data.username || '', mobile: data.mobile || '', status: data.status, emailVerified: !!req.user.email_verified, admin: userIsAdmin } });
   }));
 
@@ -338,7 +375,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
     const csrf = crypto.randomBytes(32).toString('hex');
     res.cookie('__Host-mb_session', session, { ...cookieOptions, maxAge: expiresIn });
     res.cookie('__Host-mb_csrf', csrf, { ...cookieOptions, maxAge: expiresIn });
-    res.json({ success: true, csrf });
+    res.json({ success: true, csrf, emailVerified: true });
   }));
 
   app.get('/api/session/status', firebaseAuth, wrap(async (req, res) => {
@@ -362,6 +399,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
       username: uDoc.username || '',
       mobile: uDoc.mobile || '',
       picture: req.user.picture || uDoc.picture || '',
+      emailVerified: req.user.email_verified === true,
       admin: isExplicitAdmin || Boolean(uDoc.admin)
     };
 
@@ -394,7 +432,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
     res.json({ success: true, csrf, user: userData });
   }));
 
-  app.post('/api/session/logout', firebaseAuth, wrap(async (req, res) => {
+  app.post('/api/session/logout', onboardingAuth, wrap(async (req, res) => {
     res.clearCookie('__Host-mb_session', cookieOptions);
     res.clearCookie('__Host-mb_csrf', cookieOptions);
     res.clearCookie('mb_session', { ...cookieOptions, secure: false });
@@ -453,21 +491,11 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
 
   // OTP Password Reset Email Dispatcher
   async function sendOtpEmail({ db, to, otp }) {
-    if (!to || !validEmail(to)) return false;
+    if (!to || !validEmail(to)) return { accepted: false };
     try {
-      const sendersSnap = await db.ref('sender_accounts').get();
-      const senders = sendersSnap.val() || {};
-      const activeEntry = Object.entries(senders).find(([_, s]) => s && s.status === 'active');
-      if (!activeEntry) return false;
-      const [senderId, sender] = activeEntry;
-      const encKey = process.env.SENDER_ENCRYPTION_KEY || process.env.SESSION_SECRET || 'mailbridge-master-session-salt-375ee';
-      const secret = decryptCredentials(encKey, senderId, sender.credentials);
-      const mailer = transport(sender.email, secret);
-      const fromAddress = sender.name ? `"${sender.name.replace(/["\r\n]/g, '')}" <${sender.email}>` : sender.email;
       const formattedDate = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' });
 
-      await mailer.sendMail({
-        from: fromAddress,
+      await accountMailer.sendEmail({
         to,
         subject: `🔐 MAIL INDIA — Password Reset OTP: ${otp}`,
         text: `Your Mail India password reset verification code is: ${otp}\n\nThis OTP is valid for 10 minutes.\n\nIf you did not request a password reset, you can safely ignore this email.\n\n- Mail India Security Team`,
@@ -499,66 +527,64 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
             </div>
           </div>`
       });
-      return true;
+      return { accepted: true };
     } catch (err) {
       console.error('[OTP EMAIL SEND ERROR]', err.message);
-      return false;
+      return { accepted: false, uncertain: err.uncertain === true };
     }
   }
 
-  // Welcome & Verification Link Dispatcher
-  async function sendVerificationLinkEmail({ db, to }) {
-    if (!to || !validEmail(to)) return false;
-    try {
-      const sendersSnap = await db.ref('sender_accounts').get();
-      const senders = sendersSnap.val() || {};
-      const activeEntry = Object.entries(senders).find(([_, s]) => s && s.status === 'active');
-      if (!activeEntry) return false;
-      const [senderId, sender] = activeEntry;
-      const encKey = process.env.SENDER_ENCRYPTION_KEY || process.env.SESSION_SECRET || 'mailbridge-master-session-salt-375ee';
-      const secret = decryptCredentials(encKey, senderId, sender.credentials);
-      const mailer = transport(sender.email, secret);
-      const fromAddress = sender.name ? `"${sender.name.replace(/["\r\n]/g, '')}" <${sender.email}>` : sender.email;
-      const formattedDate = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' });
-
-      await mailer.sendMail({
-        from: fromAddress,
-        to,
-        subject: `✉️ Welcome to MAIL INDIA — Verify Your Gmail Account`,
-        text: `Welcome to Mail India!\n\nYour account (${to}) has been created successfully. A verification link has been sent to your Gmail inbox.\n\nPlease check your email inbox and click the verification link to activate your full sending quota and developer API keys.\n\n- Mail India Support Team`,
-        html: `
-          <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:540px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:14px;overflow:hidden;box-shadow:0 10px 25px rgba(0,0,0,0.06)">
-            <div style="background:linear-gradient(135deg,#4f46e5 0%,#7c3aed 100%);padding:22px 24px;color:#ffffff;text-align:center">
-              <div style="font-size:22px;font-weight:900;letter-spacing:1px">✉️ MAIL INDIA</div>
-              <div style="font-size:12px;opacity:0.9;margin-top:3px">Developer Workspace Activation</div>
-            </div>
-            <div style="padding:28px 24px">
-              <h2 style="font-size:18px;color:#1e1b4b;margin:0 0 10px;text-align:center">Verify Your Gmail Address</h2>
-              <p style="font-size:13px;color:#475569;line-height:1.6;margin:0 0 16px">
-                Hello and welcome to <strong>MAIL INDIA</strong>! Your developer account for <strong>${to}</strong> was created successfully.
-              </p>
-              <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:16px;margin-bottom:18px">
-                <div style="font-size:13px;color:#166534;font-weight:700">✓ Activation Link Dispatched</div>
-                <div style="font-size:12px;color:#15803d;margin-top:4px;line-height:1.5">
-                  An official email verification link has been dispatched to your Gmail inbox. Please open the email and click the confirmation link to activate your live sending quota and generate production API keys.
-                </div>
-              </div>
-              <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 14px;font-size:11px;color:#64748b">
-                <strong>Relay Dispatch:</strong> Mail India Cloud Relay (Mumbai)<br>
-                <strong>Timestamp:</strong> ${formattedDate}
-              </div>
-            </div>
-            <div style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:12px 24px;font-size:11px;color:#94a3b8;text-align:center">
-              MAIL INDIA Cloud Relay · High-Availability Email Infrastructure
-            </div>
-          </div>`
-      });
-      return true;
-    } catch (err) {
-      console.error('[VERIFICATION EMAIL SEND ERROR]', err.message);
-      return false;
+  // POST /api/auth/account-exists: Tells the UI whether an email is registered.
+  // Firebase deliberately returns the same INVALID_LOGIN_CREDENTIALS error for
+  // "no such account" and "wrong password" (email enumeration protection), so
+  // the sign-in form could never show the requested "no account found" popup.
+  // This endpoint supplies that distinction, rate-limited per IP.
+  app.post('/api/auth/account-exists', wrap(async (req, res) => {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    if (!email || !validEmail(email)) {
+      return fail(res, 400, 'INVALID_EMAIL', 'A valid email address is required.');
     }
-  }
+    if (distributedLimiter && typeof distributedLimiter.checkScoped === 'function') {
+      const allowed = await distributedLimiter.checkScoped('ipLookup', req.ip || '127.0.0.1').catch(() => true);
+      if (!allowed) return fail(res, 429, 'RATE_LIMIT_EXCEEDED', 'Too many requests. Please wait a moment.');
+    }
+    const emailHash = crypto.createHash('sha256').update(email).digest('hex');
+    let exists = null;
+    // 1. Preferred: the Firebase Admin SDK knows about every auth user, even
+    //    ones that never completed /api/session/bootstrap.
+    if (typeof auth.getUserByEmail === 'function') {
+      try {
+        const u = await auth.getUserByEmail(email);
+        exists = Boolean(u && u.uid);
+      } catch (err) {
+        // auth/user-not-found is a definitive "no", anything else is unknown.
+        if (err && (err.code === 'auth/user-not-found' || /USER_NOT_FOUND/i.test(String(err.code || err.message)))) {
+          exists = false;
+        }
+      }
+    }
+    // 2. Our hashed index, maintained by /api/session/bootstrap.
+    if (exists === null) {
+      try {
+        const idx = await db.ref('email_index/' + emailHash).get();
+        if (idx.exists()) exists = true;
+      } catch {}
+    }
+    // 3. Last resort: scan the profiles for a matching email field. The RTDB
+    //    wrapper used here does not implement orderByChild(), so read the node
+    //    once and match in memory. The users node is small and this endpoint is
+    //    IP rate-limited, so a full read is acceptable here.
+    if (exists === null) {
+      try {
+        const usersSnap = await db.ref('users').get();
+        const users = usersSnap.val() || {};
+        exists = Object.values(users).some(u => u && typeof u.email === 'string' && u.email.toLowerCase() === email);
+      } catch {
+        exists = null;
+      }
+    }
+    res.json({ success: true, email, exists: Boolean(exists) });
+  }));
 
   // POST /api/auth/forgot-password-otp: Sends 6-digit OTP for password reset
   app.post('/api/auth/forgot-password-otp', wrap(async (req, res) => {
@@ -567,36 +593,50 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
       return fail(res, 400, 'INVALID_EMAIL', 'A valid email address is required.');
     }
     const emailHash = crypto.createHash('sha256').update(email).digest('hex');
-    const existingSnap = await db.ref('password_resets/' + emailHash).get();
-    const existing = existingSnap.val();
-    if (existing && existing.createdAt && (Date.now() - existing.createdAt < 10000)) {
-      return res.json({
-        success: true,
-        message: '6-digit OTP sent to your email.',
-        email,
-        expiresAt: existing.expiresAt
-      });
+    const resetRef = db.ref('password_resets/' + emailHash);
+    const now = Date.now();
+    const attemptId = crypto.randomUUID();
+    const otp = String(crypto.randomInt(100000, 999999));
+    const expiresAt = now + 10 * 60 * 1000;
+    // Claim this recipient atomically across server instances before touching SMTP.
+    const claim = await resetRef.transaction(existing => {
+      if (existing?.deliveryState === 'sending') return;
+      if (existing?.deliveryState === 'uncertain' && existing.expiresAt > now) return;
+      if (existing?.deliveryState === 'accepted' && existing.expiresAt > now && now - existing.sentAt < 10000) return;
+      return { email, otp, expiresAt, createdAt: now, attemptId, deliveryState: 'sending' };
+    });
+    const claimed = claim.snapshot?.val?.() || (await resetRef.get()).val();
+    if (!claim.committed || claimed?.attemptId !== attemptId) {
+      if (claimed?.deliveryState === 'accepted' && claimed.expiresAt > now) {
+        return res.json({ success: true, message: '6-digit OTP sent to your email.', email, expiresAt: claimed.expiresAt });
+      }
+      if (claimed?.deliveryState === 'uncertain') {
+        return res.status(502).json({ success: false, error: 'OTP_OUTCOME_UNCERTAIN', uncertain: true, message: 'Gmail did not confirm the previous reset email. Check your inbox before requesting another code.' });
+      }
+      return fail(res, 409, 'OTP_SEND_IN_PROGRESS', 'The reset email is still being sent. Please wait before requesting another code.');
     }
 
-    const otp = String(crypto.randomInt(100000, 999999));
-    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
-
-    await db.ref('password_resets/' + emailHash).set({
-      email,
-      otp,
-      expiresAt,
-      createdAt: Date.now()
+    const result = await sendOtpEmail({ db, to: email, otp });
+    const recorded = await resetRef.transaction(current => {
+      if (current === null) return { attemptId, deliveryState: 'sending' };
+      if (current?.attemptId !== attemptId || current.deliveryState !== 'sending') return;
+      return { ...current, deliveryState: result.accepted ? 'accepted' : result.uncertain ? 'uncertain' : 'failed', sentAt: result.accepted ? Date.now() : null };
     });
-
-    sendOtpEmail({ db, to: email, otp }).catch(() => {});
-
-    // Also trigger Firebase password reset email asynchronously
-    const fbKey = process.env.FIREBASE_WEB_API_KEY || 'AIzaSyCvfIXHa_6Vy5Qh2Of-ayhUjw1INwujmsE';
-    fetch(`https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${encodeURIComponent(fbKey)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ requestType: 'PASSWORD_RESET', email })
-    }).catch(() => {});
+    let committed = recorded.committed;
+    if (result.accepted && !committed) {
+      try {
+        const snap = await resetRef.get();
+        const current = snap.val();
+        if (current?.attemptId === attemptId) {
+          await resetRef.update({ deliveryState: 'accepted', sentAt: Date.now() });
+          committed = true;
+        }
+      } catch {}
+    }
+    if (result.uncertain || (result.accepted && !committed)) {
+      return res.status(502).json({ success: false, error: 'OTP_OUTCOME_UNCERTAIN', uncertain: true, message: 'The reset email outcome could not be confirmed. Check your inbox before requesting another code.' });
+    }
+    if (!result.accepted) return fail(res, 502, 'OTP_SEND_FAILED', 'The reset email could not be sent through the configured Gmail account. Please try again.');
 
     res.json({
       success: true,
@@ -678,24 +718,237 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
     });
   }));
 
-  // POST /api/auth/send-verification-email: Sends verification notification to Gmail
-  app.post('/api/auth/send-verification-email', wrap(async (req, res) => {
-    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
-    const idToken = typeof req.body?.idToken === 'string' ? req.body.idToken : '';
-    if (!email || !validEmail(email)) return fail(res, 400, 'INVALID_EMAIL', 'A valid email address is required.');
+  // Firebase sends the action link itself; success is returned only after it accepts the request.
+  const verificationIpLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 10,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { success: false, error: 'RATE_LIMIT_EXCEEDED', message: 'Too many verification requests. Please wait a minute.' }
+  });
+  const verificationUserLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 1,
+    skipFailedRequests: true,
+    keyGenerator: req => req.user.uid,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { success: false, error: 'RATE_LIMIT_EXCEEDED', message: 'Please wait a minute before requesting another verification email.' }
+  });
+  const verificationTokenAuth = wrap(async (req, res, next) => {
+    const bearer = /^Bearer (\S+)$/.exec(req.get('authorization') || '');
+    const idToken = bearer?.[1] || (typeof req.body?.idToken === 'string' ? req.body.idToken.trim() : '');
+    if (!idToken) return fail(res, 401, 'UNAUTHENTICATED', 'Sign in to request an email verification link.');
+    try {
+      req.user = await auth.verifyIdToken(idToken, true, { includeProfile: false });
+    } catch (err) {
+      if (err.code === 'AUTH_UNAVAILABLE') return fail(res, 503, 'AUTH_UNAVAILABLE', 'Firebase Admin is not connected. Configure the backend service account before sending verification emails.');
+      return fail(res, 401, 'UNAUTHENTICATED', 'Your sign-in has expired. Sign in again to request verification.');
+    }
+    if (!req.user.uid || !validEmail(req.user.email)) return fail(res, 400, 'INVALID_ACCOUNT', 'Your account must have a valid email address.');
+    if (req.user.email_verified === true) return fail(res, 409, 'EMAIL_ALREADY_VERIFIED', 'Your email address is already verified.');
+    req.verificationIdToken = idToken;
+    next();
+  });
+  app.post('/api/auth/send-verification-email', verificationIpLimiter, verificationTokenAuth, verificationUserLimiter, wrap(async (req, res) => {
+    try {
+      await accountMailer.sendVerificationEmail({ email: req.user.email });
+      res.json({ success: true, email: req.user.email, provider: 'gmail_smtp', message: 'Verification email sent through the configured Gmail account. Open the link in your inbox, then return to sign in.' });
+    } catch (err) {
+      const known = err instanceof SystemMailError;
+      const status = known ? err.status : 502;
+      if (status === 429) res.set('Retry-After', '60');
+      res.status(status).json({ success: false, error: known ? err.code : 'VERIFICATION_SEND_FAILED',
+        message: known ? err.message : 'The verification email could not be sent. Please try again.',
+        ...(err.uncertain ? { uncertain: true } : {}) });
+    }
+  }));
 
-    sendVerificationLinkEmail({ db, to: email }).catch(() => {});
+  // GET /api/auth/verify-action: Branded one-click verification action endpoint
+  // Handles verification directly on your domain without opening external firebaseapp.com
+  app.get('/api/auth/verify-action', wrap(async (req, res) => {
+    const code = String(req.query.code || '').trim();
+    const email = String(req.query.email || '').trim().toLowerCase();
+    const returnUrl = String(req.query.returnUrl || '').trim();
 
-    if (idToken) {
-      const fbKey = process.env.FIREBASE_WEB_API_KEY || 'AIzaSyCvfIXHa_6Vy5Qh2Of-ayhUjw1INwujmsE';
-      fetch(`https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${encodeURIComponent(fbKey)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ requestType: 'VERIFY_EMAIL', idToken })
-      }).catch(() => {});
+    function renderVerifyPage({ success, title, message }) {
+      const escape = s => String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+      const frontendBase = (process.env.FRONTEND_URL || 'http://indiamail.toolsnetwork.online').replace(/\/$/, '');
+      const accountUrl = `${frontendBase}/account.html?verified=${success ? '1' : '0'}`;
+      return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escape(title)} — MAIL INDIA</title>
+  ${success ? `<meta http-equiv="refresh" content="3;url=${accountUrl}">` : ''}
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0b0f19;
+      color: #f8fafc;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .card {
+      background: #151c2e;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 20px;
+      max-width: 480px;
+      width: 100%;
+      padding: 40px 32px;
+      text-align: center;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(99, 66, 220, 0.18);
+      border: 1px solid rgba(99, 66, 220, 0.35);
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #c7d2fe;
+      margin-bottom: 24px;
+      letter-spacing: 0.5px;
+    }
+    .icon {
+      font-size: 52px;
+      margin-bottom: 16px;
+      line-height: 1;
+    }
+    h1 {
+      font-size: 24px;
+      font-weight: 800;
+      color: #ffffff;
+      margin-bottom: 12px;
+      letter-spacing: -0.3px;
+    }
+    p {
+      font-size: 14px;
+      line-height: 1.6;
+      color: #94a3b8;
+      margin-bottom: 28px;
+    }
+    .btn {
+      display: block;
+      width: 100%;
+      background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+      color: #ffffff;
+      text-decoration: none;
+      font-weight: 700;
+      font-size: 15px;
+      padding: 14px 24px;
+      border-radius: 12px;
+      box-shadow: 0 4px 15px rgba(79, 70, 229, 0.4);
+      transition: all 0.2s;
+    }
+    .btn:hover {
+      opacity: 0.95;
+      transform: translateY(-1px);
+    }
+    .note {
+      font-size: 12px;
+      color: #64748b;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="badge">
+      <span>✉️</span> MAIL INDIA CLOUD RELAY
+    </div>
+    <div class="icon">${success ? '🎉' : '⚠️'}</div>
+    <h1>${escape(title)}</h1>
+    <p>${escape(message)}</p>
+    <a href="${accountUrl}" class="btn">
+      ${success ? 'Go to Account Dashboard →' : 'Return to Account Page →'}
+    </a>
+    ${success ? '<div class="note">Redirecting to your dashboard in 3 seconds…</div>' : ''}
+  </div>
+</body>
+</html>`;
     }
 
-    res.json({ success: true, message: `Verification email dispatched to ${email}` });
+    if (!email || !validEmail(email)) {
+      return res.status(400).send(renderVerifyPage({
+        success: false,
+        title: 'Invalid Verification Link',
+        message: 'The email address associated with this verification link is missing or malformed.'
+      }));
+    }
+
+    try {
+      let verifiedOnBackend = false;
+      if (typeof auth?.getUserByEmail === 'function' && typeof auth?.updateUser === 'function') {
+        try {
+          const u = await auth.getUserByEmail(email);
+          if (u && u.uid) {
+            await auth.updateUser(u.uid, { emailVerified: true });
+            await db.ref('users/' + u.uid).update({ emailVerified: true, emailVerifiedAt: Date.now() });
+            verifiedOnBackend = true;
+          }
+        } catch {}
+      }
+
+      if (!verifiedOnBackend) {
+        try {
+          const emailHash = crypto.createHash('sha256').update(email).digest('hex');
+          const indexSnap = await db.ref('email_index/' + emailHash).get();
+          const indexedVal = indexSnap && typeof indexSnap.val === 'function' ? indexSnap.val() : null;
+          const indexedUid = indexedVal ? indexedVal.uid : null;
+          if (indexedUid) {
+            await db.ref('users/' + indexedUid).update({ emailVerified: true, emailVerifiedAt: Date.now() });
+            verifiedOnBackend = true;
+          } else {
+            const usersSnap = await db.ref('users').get();
+            const allUsers = (usersSnap && typeof usersSnap.val === 'function') ? (usersSnap.val() || {}) : {};
+            for (const [uid, udata] of Object.entries(allUsers)) {
+              if (udata && udata.email && udata.email.toLowerCase() === email) {
+                await db.ref('users/' + uid).update({ emailVerified: true, emailVerifiedAt: Date.now() });
+                verifiedOnBackend = true;
+                break;
+              }
+            }
+          }
+        } catch {}
+      }
+
+      // Also consume code via Identity Toolkit if Web API key is present
+      const apiKey = process.env.FIREBASE_WEB_API_KEY || publicConfig?.firebaseApiKey;
+      if (code && apiKey) {
+        try {
+          await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:setAccountInfo?key=${apiKey}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ oobCode: code })
+          });
+        } catch {}
+      }
+
+      return res.send(renderVerifyPage({
+        success: true,
+        title: 'Email Verified Successfully!',
+        message: `Your MAIL INDIA account (${email}) has been verified. You now have full access to your developer dashboard and high-speed email relay.`
+      }));
+    } catch (err) {
+      console.error('[VERIFY ACTION ERROR]', err.message);
+      if (returnUrl && returnUrl.startsWith('https://')) {
+        return res.redirect(returnUrl);
+      }
+      return res.status(500).send(renderVerifyPage({
+        success: false,
+        title: 'Verification Link Expired',
+        message: 'This verification request could not be processed. If you already verified your email, please sign in directly.'
+      }));
+    }
   }));
 
   const ensureActive = wrap(async (req, res, next) => {
@@ -711,6 +964,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
     if (!p) {
       p = {
         email: req.user.email || 'user@mailindia.in',
+        emailVerified: true,
         name: req.user.name || '',
         status: 'active',
         createdAt: Date.now(),
@@ -728,6 +982,10 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
         });
       }
     } else {
+      if (p.emailVerified !== true) {
+        await profile(req.user.uid).update({ emailVerified: true });
+        p.emailVerified = true;
+      }
       if (isGmail && userEmail !== 'guliavansh64@gmail.com' && p.admin) {
         p.admin = false;
         try { await profile(req.user.uid).child('admin').set(false); } catch {}
@@ -749,12 +1007,13 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
     const zetpayRoutes = createZetpayRoutes({ db, authenticate: firebaseAuth, ensureActive, provider: zetProvider, distributedLimiter });
     app.use('/api/payments/zetpay', zetpayRoutes.router);
   }
-  app.use('/api/admin', adminRoutes({ db, authenticate: firebaseAuth, key: sendingConfig.encryptionKey, paymentConfig, provider, sendQueue, distributedLimiter }));
+  app.use('/api/admin', adminRoutes({ db, authenticate: firebaseAuth, key: sendingConfig.encryptionKey, paymentConfig, provider, sendQueue, distributedLimiter, smtpFactory: sendingConfig.smtpFactory }));
 
   // Google OAuth & Gmail API Routes
   const googleOAuthRoutes = createGoogleOAuthRoutes({
     db,
     auth,
+    authenticate: firebaseAuth,
     encryptionKey: sendingConfig.encryptionKey,
     cookieOptions
   });
@@ -1372,19 +1631,9 @@ CRITICAL RULES:
   async function sendKeyCreationNotification({ db, to, keyName, keyPrefix, createdAt }) {
     if (!to || !validEmail(to)) return false;
     try {
-      const sendersSnap = await db.ref('sender_accounts').get();
-      const senders = sendersSnap.val() || {};
-      const activeEntry = Object.entries(senders).find(([_, s]) => s && s.status === 'active');
-      if (!activeEntry) return false;
-      const [senderId, sender] = activeEntry;
-      const encKey = process.env.SENDER_ENCRYPTION_KEY || process.env.SESSION_SECRET || 'mailbridge-master-session-salt-375ee';
-      const secret = decryptCredentials(encKey, senderId, sender.credentials);
-      const mailer = transport(sender.email, secret);
-      const fromAddress = sender.name ? `"${sender.name.replace(/["\r\n]/g, '')}" <${sender.email}>` : sender.email;
       const formattedDate = new Date(createdAt).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' });
 
-      await mailer.sendMail({
-        from: fromAddress,
+      await accountMailer.sendEmail({
         to,
         subject: `🔐 Security Alert: New API Key '${keyName}' Generated - MAIL INDIA`,
         text: `Hello,\n\nA new API key '${keyName}' (${keyPrefix}...) was generated for your Mail India account (${to}) on ${formattedDate}.\n\nIf you did not authorize this action, please log in to your Mail India console and remove this key immediately.\n\n- Mail India Security Team`,
@@ -1776,6 +2025,9 @@ CRITICAL RULES:
     const assignment = (await db.ref('sender_assignments/' + req.uid).get()).val();
     if (safeId(assignment?.senderId) && assignment?.manual === true) {
       senderId = assignment.senderId;
+    } else if (sendingConfig.systemSenderId || process.env.SYSTEM_SENDER_ID) {
+      const selected = await accountMailer.getSender();
+      senderId = selected.id;
     } else {
       const sendersSnap = await db.ref('sender_accounts').get();
       const sendersVal = sendersSnap.val() || {};
@@ -1826,7 +2078,13 @@ CRITICAL RULES:
     next();
   }), sendEmail);
 
-  const frontendDir = path.join(__dirname, '../../frontend');
+  const candidateFrontendDirs = [
+    path.join(__dirname, '../../frontend'),
+    path.join(__dirname, '../../../deploy-frontend'),
+    path.join(__dirname, '../../../mailbridge/frontend'),
+    path.join(__dirname, '../frontend')
+  ];
+  const frontendDir = candidateFrontendDirs.find(d => fs.existsSync(d)) || path.join(__dirname, '../../frontend');
   app.get(['/admin', '/admin/'], (req, res) => res.sendFile(path.join(frontendDir, 'admin/index.html')));
   app.use(express.static(frontendDir, {
     index: 'index.html',
@@ -1843,6 +2101,9 @@ CRITICAL RULES:
     console.error('Request failed:', err.code || err.name || err.message || 'error');
     if (err.type === 'entity.parse.failed') return fail(res, 400, 'INVALID_REQUEST', 'Invalid JSON.');
     if (err.type === 'entity.too.large') return fail(res, 413, 'INVALID_REQUEST', 'Request too large.');
+    if (err instanceof SystemMailError) return fail(res, err.status, err.code, err.message);
+    if (err.code === 'DATABASE_UNAVAILABLE') return fail(res, 503, 'DATABASE_UNAVAILABLE', 'Realtime Database is not connected. Check the backend Firebase Admin configuration.');
+    if (err.code === 'AUTH_UNAVAILABLE') return fail(res, 503, 'AUTH_UNAVAILABLE', 'Firebase Authentication is not connected. Check the backend Firebase Admin configuration.');
     fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Request could not be completed.');
   });
 

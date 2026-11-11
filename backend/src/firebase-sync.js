@@ -198,7 +198,7 @@ function createFirebaseDatabase({ databaseUrl }) {
 
   init();
 
-  return {
+  const dbInstance = {
     root,
     ready: () => readyPromise,
     close() {
@@ -210,6 +210,9 @@ function createFirebaseDatabase({ databaseUrl }) {
 
       return {
         key: currentPath ? currentPath.split('/').pop() : null,
+        child(childPath) {
+          return dbInstance.ref([currentPath, cleanPath(childPath)].filter(Boolean).join('/'));
+        },
         async get() {
           await readyPromise;
           const val = getByPath(root, currentPath);
@@ -320,6 +323,7 @@ function createFirebaseDatabase({ databaseUrl }) {
       };
     }
   };
+  return dbInstance;
 }
 
 // Google public certs cache for verifying Firebase ID tokens
@@ -331,7 +335,9 @@ async function getGooglePublicCerts() {
   if (publicCertsCache && now < publicCertsExpiry) {
     return publicCertsCache;
   }
-  const res = await fetch('https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com');
+  const res = await fetch('https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com', {
+    signal: AbortSignal.timeout(10_000)
+  });
   if (!res.ok) throw new Error('Failed to fetch Google public certificates');
   const cacheControl = res.headers.get('cache-control') || '';
   const maxAgeMatch = cacheControl.match(/max-age=(\d+)/);
@@ -341,32 +347,42 @@ async function getGooglePublicCerts() {
   return publicCertsCache;
 }
 
-function createFirebaseAuth({ projectId, db, sessionSecret = 'mailbridge-firebase-secret-key-salt' }) {
+function createFirebaseAuth({ projectId, db, sessionSecret, adminAuth }) {
   const revokedUids = new Map(); // uid -> revokedTimestampMs
 
   return {
-    async verifyIdToken(idToken, checkRevoked = false) {
+    async verifyIdToken(idToken, checkRevoked = false, { includeProfile = true } = {}) {
       if (!idToken || typeof idToken !== 'string') {
         throw new Error('ID token must be a non-empty string');
       }
-      const decodedComplete = jwt.decode(idToken, { complete: true });
-      if (!decodedComplete || !decodedComplete.header || !decodedComplete.header.kid) {
-        throw new Error('Malformed Firebase ID token');
+      let verified;
+      if (adminAuth) {
+        try {
+          verified = await adminAuth.verifyIdToken(idToken, checkRevoked);
+        } catch (adminErr) {
+          if (adminErr.code === 'AUTH_UNAVAILABLE' || adminErr.status === 503) {
+            verified = null;
+          } else {
+            throw adminErr;
+          }
+        }
+      }
+      if (!verified) {
+        const decodedComplete = jwt.decode(idToken, { complete: true });
+        if (!decodedComplete || !decodedComplete.header || !decodedComplete.header.kid) {
+          throw new Error('Malformed Firebase ID token');
+        }
+        const certs = await getGooglePublicCerts();
+        const cert = certs[decodedComplete.header.kid];
+        if (!cert) throw new Error(`Public key not found for kid: ${decodedComplete.header.kid}`);
+        verified = jwt.verify(idToken, cert, {
+          algorithms: ['RS256'],
+          audience: projectId,
+          issuer: `https://securetoken.google.com/${projectId}`
+        });
       }
 
-      const certs = await getGooglePublicCerts();
-      const cert = certs[decodedComplete.header.kid];
-      if (!cert) {
-        throw new Error(`Public key not found for kid: ${decodedComplete.header.kid}`);
-      }
-
-      const verified = jwt.verify(idToken, cert, {
-        algorithms: ['RS256'],
-        audience: projectId,
-        issuer: `https://securetoken.google.com/${projectId}`
-      });
-
-      const uid = verified.user_id || verified.sub;
+      const uid = verified.uid || verified.user_id || verified.sub;
       if (checkRevoked && revokedUids.has(uid)) {
         const revokedAt = revokedUids.get(uid);
         if (verified.auth_time * 1000 < revokedAt) {
@@ -374,9 +390,9 @@ function createFirebaseAuth({ projectId, db, sessionSecret = 'mailbridge-firebas
         }
       }
 
-      // Check if user is marked admin in Firebase Realtime Database
+      // Verification email dispatch needs only the signed identity, not an admin profile.
       let isAdmin = Boolean(verified.admin);
-      if (db) {
+      if (db && includeProfile) {
         try {
           const userSnap = await db.ref(`users/${uid}`).get();
           const u = userSnap.val();
@@ -387,12 +403,13 @@ function createFirebaseAuth({ projectId, db, sessionSecret = 'mailbridge-firebas
       return {
         ...verified,
         uid,
-        email_verified: Boolean(verified.email_verified),
+        email_verified: verified.email_verified === true,
         admin: isAdmin
       };
     },
 
     async createSessionCookie(idTokenOrUser, options = {}) {
+      if (!sessionSecret) throw Object.assign(new Error('SESSION_SECRET is required to create sessions.'), { code: 'AUTH_UNAVAILABLE', status: 503 });
       let user;
       if (idTokenOrUser && typeof idTokenOrUser === 'object' && idTokenOrUser.uid) {
         user = idTokenOrUser;
@@ -400,13 +417,16 @@ function createFirebaseAuth({ projectId, db, sessionSecret = 'mailbridge-firebas
         try {
           user = await this.verifyIdToken(idTokenOrUser);
         } catch {
-          // If not a valid RS256 Firebase ID token (e.g. uid from Google OAuth or dev), load from db
+          // Internal OAuth callers may use an existing, explicitly verified user ID.
           let uRecord = null;
           if (db) {
             try {
               const snap = await db.ref(`users/${idTokenOrUser}`).get();
               uRecord = snap.val();
             } catch {}
+          }
+          if (!uRecord || uRecord.emailVerified !== true) {
+            throw new Error('A verified email address is required to create a session');
           }
           const email = uRecord?.email || (idTokenOrUser.includes('@') ? idTokenOrUser : '');
           const isExplicitAdmin = (email === 'guliavansh64@gmail.com') || Boolean(uRecord?.admin);
@@ -415,13 +435,16 @@ function createFirebaseAuth({ projectId, db, sessionSecret = 'mailbridge-firebas
             email,
             name: uRecord?.name || '',
             picture: uRecord?.picture || '',
-            email_verified: Boolean(uRecord?.emailVerified ?? true),
+            email_verified: uRecord.emailVerified === true,
             admin: isExplicitAdmin,
             auth_time: Math.floor(Date.now() / 1000)
           };
         }
       } else {
         throw new Error('Invalid token or user provided to createSessionCookie');
+      }
+      if (user.email_verified !== true) {
+        throw new Error('A verified email address is required to create a session');
       }
 
       const expiresInMs = options.expiresIn || 8 * 3600 * 1000;
@@ -430,7 +453,7 @@ function createFirebaseAuth({ projectId, db, sessionSecret = 'mailbridge-firebas
         email: user.email || '',
         name: user.name || '',
         picture: user.picture || '',
-        email_verified: Boolean(user.email_verified),
+        email_verified: true,
         admin: Boolean(user.admin),
         auth_time: user.auth_time || Math.floor(Date.now() / 1000),
         iat: Math.floor(Date.now() / 1000),
@@ -441,6 +464,7 @@ function createFirebaseAuth({ projectId, db, sessionSecret = 'mailbridge-firebas
     },
 
     async verifySessionCookie(sessionCookie, checkRevoked = false) {
+      if (!sessionSecret) throw Object.assign(new Error('SESSION_SECRET is required to verify sessions.'), { code: 'AUTH_UNAVAILABLE', status: 503 });
       if (!sessionCookie || typeof sessionCookie !== 'string') {
         throw new Error('Missing session cookie');
       }
@@ -466,8 +490,30 @@ function createFirebaseAuth({ projectId, db, sessionSecret = 'mailbridge-firebas
 
       return {
         ...decoded,
+        email_verified: decoded.email_verified === true,
         admin: isAdmin
       };
+    },
+
+    async generateEmailVerificationLink(email, actionCodeSettings) {
+      if (!adminAuth?.generateEmailVerificationLink) {
+        throw Object.assign(new Error('Firebase Admin credentials are required to generate verification links.'), { code: 'AUTH_UNAVAILABLE', status: 503 });
+      }
+      return adminAuth.generateEmailVerificationLink(email, actionCodeSettings);
+    },
+
+    async getUserByEmail(email) {
+      if (typeof adminAuth?.getUserByEmail === 'function') {
+        return adminAuth.getUserByEmail(email);
+      }
+      return null;
+    },
+
+    async updateUser(uid, properties) {
+      if (typeof adminAuth?.updateUser === 'function') {
+        return adminAuth.updateUser(uid, properties);
+      }
+      return null;
     },
 
     async revokeRefreshTokens(uid) {

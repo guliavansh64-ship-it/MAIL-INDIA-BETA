@@ -63,12 +63,17 @@ console.log('🗜  Compressing Root-Level ZIP Archives...');
 const frontendZip = path.join(WORKSPACE_DIR, 'mailbridge-frontend.zip');
 const backendZip = path.join(WORKSPACE_DIR, 'mailbridge-backend.zip');
 
-if (fs.existsSync(frontendZip)) fs.unlinkSync(frontendZip);
-if (fs.existsSync(backendZip)) fs.unlinkSync(backendZip);
+function zipDirectory(sourceDir, targetZip) {
+  if (fs.existsSync(targetZip)) fs.unlinkSync(targetZip);
+  try {
+    execSync(`cd "${sourceDir}" && zip -r -q "${targetZip}" .`, { stdio: 'pipe' });
+  } catch {
+    execSync(`powershell -NoProfile -Command "Compress-Archive -Path '${sourceDir}\\*' -DestinationPath '${targetZip}' -Force"`, { stdio: 'inherit' });
+  }
+}
 
-// Note: "cd ... && zip -r -q output ." ensures archive extracts root-level files without subfolder
-execSync(`cd "${CLEAN_FRONTEND}" && zip -r -q "${frontendZip}" .`, { stdio: 'inherit' });
-execSync(`cd "${CLEAN_BACKEND}" && zip -r -q "${backendZip}" .`, { stdio: 'inherit' });
+zipDirectory(CLEAN_FRONTEND, frontendZip);
+zipDirectory(CLEAN_BACKEND, backendZip);
 
 // Also create aliases
 fs.copyFileSync(frontendZip, path.join(WORKSPACE_DIR, 'mailbridge-frontend-unencrypted.zip'));
