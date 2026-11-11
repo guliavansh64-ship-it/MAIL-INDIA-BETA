@@ -228,6 +228,29 @@ function createGoogleOAuthRoutes({
       let uid;
       let isNewUser = false;
 
+      // Strictly enforce separation: accounts created with email & password cannot log in via Google
+      let fbUser = null;
+      if (auth && typeof auth.getUserByEmail === 'function') {
+        try {
+          fbUser = await auth.getUserByEmail(userEmail);
+        } catch {}
+      }
+
+      const hasPasswordProvider = Boolean(fbUser && Array.isArray(fbUser.providerData) && fbUser.providerData.some(p => p && p.providerId === 'password'));
+      const isPasswordInDb = Boolean(
+        userEntry && (
+          userEntry[1].authProvider === 'password' ||
+          userEntry[1].passwordHash ||
+          userEntry[1].passwordUpdatedAt ||
+          (!userEntry[1].googleId && !userEntry[0].startsWith('google_') && userEntry[1].authProvider !== 'google')
+        )
+      );
+
+      if (hasPasswordProvider || isPasswordInDb) {
+        console.warn('[GOOGLE SIGN-IN REJECTED] Account was created with email and password:', { email: userEmail });
+        return res.redirect(clientRedirect(`/account.html?error=${encodeURIComponent('This account was created with email and password. Please sign in with your email and password.')}`, req));
+      }
+
       const adminEmails = (process.env.ADMIN_EMAILS || 'guliavansh64@gmail.com').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
       const isExplicitAdmin = (userEmail === 'guliavansh64@gmail.com');
 

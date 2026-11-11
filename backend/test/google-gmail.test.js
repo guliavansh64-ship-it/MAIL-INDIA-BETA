@@ -298,6 +298,72 @@ test('GET /oauth/google/callback validates state, provisions user, grants 10 cre
   }
 });
 
+test('GET /oauth/google/callback blocks Google login if account was created with email and password', async () => {
+  const db = memoryDb();
+  // Existing account created with email and password
+  await db.ref('users/user_pwd_123').set({
+    email: 'existingpwduser@gmail.com',
+    authProvider: 'password',
+    name: 'Password User',
+    status: 'active',
+    createdAt: Date.now()
+  });
+
+  const app = createApp({ db, auth: fakeAuth, sendingConfig: { encryptionKey: encKey } });
+
+  const testState = 'pwd-test-state-xyz';
+  await db.ref(`oauth_states/${testState}`).set({
+    type: 'google_signin',
+    createdAt: Date.now(),
+    expiresAt: Date.now() + 600000
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const urlStr = url.toString();
+    if (urlStr.includes('oauth2.googleapis.com/token')) {
+      return {
+        ok: true,
+        json: async () => ({ access_token: 'mock-google-token' })
+      };
+    }
+    if (urlStr.includes('googleapis.com/oauth2/v2/userinfo')) {
+      return {
+        ok: true,
+        json: async () => ({
+          id: '987654321',
+          verified_email: true,
+          email: 'existingpwduser@gmail.com',
+          name: 'Google Impersonator'
+        })
+      };
+    }
+    throw new Error('unexpected URL: ' + urlStr);
+  };
+
+  try {
+    const res = await request(app)
+      .get(`/oauth/google/callback?code=mock-code&state=${testState}`);
+
+    assert.equal(res.status, 302);
+    assert.ok(res.headers.location.includes('/account.html?error='));
+    const decodedUrl = decodeURIComponent(res.headers.location);
+    assert.ok(decodedUrl.includes('This account was created with email and password'));
+
+    // Assert that no session cookies were created
+    const cookies = res.headers['set-cookie'] || [];
+    assert.ok(!cookies.some(c => c.includes('mb_session=')));
+
+    // Assert that the user profile was NOT overwritten with googleId
+    const userSnap = await db.ref('users/user_pwd_123').get();
+    const userVal = userSnap.val();
+    assert.equal(userVal.authProvider, 'password');
+    assert.equal(userVal.googleId, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('GET /oauth/gmail/connect requires authentication and requests gmail.send offline scope', async () => {
   const db = memoryDb();
   const app = createApp({ db, auth: fakeAuth, sendingConfig: { encryptionKey: encKey } });

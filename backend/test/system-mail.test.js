@@ -127,3 +127,44 @@ test('a changed or paused sender cannot send after the verification link was gen
   await assert.rejects(f.mailer.sendVerificationEmail(verification), { code: 'SYSTEM_SENDER_UNAVAILABLE' });
   assert.equal(f.sent.length, 0);
 });
+
+test('system mailer supports OAuth2 Gmail sender accounts', async () => {
+  const oauthSender = {
+    email: 'oauthadmin@gmail.com',
+    name: 'Mail India Admin',
+    host: 'smtp.gmail.com',
+    authType: 'oauth2',
+    provider: 'gmail_oauth',
+    status: 'active',
+    verifiedAt: Date.now(),
+    dailyLimit: 500,
+    credentials: encryptCredentials(key, 'oauth_snd_1', {
+      type: 'oauth2',
+      clientId: 'client-123.apps.googleusercontent.com',
+      clientSecret: 'secret-xyz',
+      refreshToken: 'refresh-token-abc',
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true
+    })
+  };
+  const db = memoryDb({ sender_accounts: { oauth_snd_1: oauthSender } });
+  const f = fixture({ db, senderId: 'oauth_snd_1' });
+  const result = await f.mailer.sendVerificationEmail(verification);
+  assert.equal(result.success, true);
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].email, 'oauthadmin@gmail.com');
+  assert.equal(f.sent[0].secret.type, 'oauth2');
+  assert.equal(f.sent[0].secret.refreshToken, 'refresh-token-abc');
+});
+
+test('system mailer falls back to active Gmail sender when configured SYSTEM_SENDER_ID was deleted', async () => {
+  const activeSender = sender('active_gmail', 'active@gmail.com');
+  const db = memoryDb({ sender_accounts: { active_gmail: activeSender } });
+  // Pass a senderId that does NOT exist in sender_accounts
+  const f = fixture({ db, senderId: 'deleted_sender_id' });
+  const result = await f.mailer.sendVerificationEmail(verification);
+  assert.equal(result.success, true);
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].email, 'active@gmail.com');
+});

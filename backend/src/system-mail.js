@@ -38,7 +38,7 @@ function smtpError(error, phase = 'send') {
 
 const escapeHtml = value => String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const isVerified = sender => Number.isFinite(sender?.verifiedAt) && sender.verifiedAt > 0;
-const isGmail = sender => sender?.authType === 'app_password' && String(sender.host || 'smtp.gmail.com').toLowerCase() === 'smtp.gmail.com' && validEmail(sender.email);
+const isGmail = sender => (sender?.authType === 'app_password' || sender?.authType === 'oauth2' || sender?.provider === 'gmail_oauth' || sender?.provider === 'gmail') && String(sender.host || 'smtp.gmail.com').toLowerCase() === 'smtp.gmail.com' && validEmail(sender.email);
 
 function createSystemMailer({ db, auth, encryptionKey, senderId = process.env.SYSTEM_SENDER_ID || '', smtpFactory = transport }) {
   async function getSender() {
@@ -47,8 +47,19 @@ function createSystemMailer({ db, auth, encryptionKey, senderId = process.env.SY
     try {
       if (senderId) {
         if (!safeId(senderId)) throw new SystemMailError('SYSTEM_SENDER_INVALID', 'SYSTEM_SENDER_ID must identify a configured Gmail sender.');
-        selected = [senderId, (await db.ref('sender_accounts/' + senderId).get()).val()];
-        if (!selected[1]) throw new SystemMailError('SYSTEM_SENDER_NOT_FOUND', 'The configured system Gmail sender was not found.');
+        const snap = (await db.ref('sender_accounts/' + senderId).get()).val();
+        if (snap) {
+          selected = [senderId, snap];
+        } else {
+          // If the configured senderId no longer exists, fall back to eligible active senders
+          const senders = (await db.ref('sender_accounts').get()).val() || {};
+          const eligible = Object.entries(senders).filter(([, sender]) => isGmail(sender) && sender.status === 'active' && isVerified(sender));
+          if (eligible.length > 0) {
+            selected = eligible[0];
+          } else {
+            throw new SystemMailError('SYSTEM_SENDER_NOT_FOUND', 'The configured system Gmail sender was not found.');
+          }
+        }
       } else {
         const senders = (await db.ref('sender_accounts').get()).val() || {};
         const eligible = Object.entries(senders).filter(([, sender]) => isGmail(sender) && sender.status === 'active' && isVerified(sender));
@@ -61,7 +72,7 @@ function createSystemMailer({ db, auth, encryptionKey, senderId = process.env.SY
       throw new SystemMailError('DATABASE_UNAVAILABLE', 'Could not read the system sender from Realtime Database.');
     }
     const [id, sender] = selected;
-    if (!isGmail(sender)) throw new SystemMailError('SYSTEM_SENDER_NOT_GMAIL', 'The system sender must use a Gmail app password and smtp.gmail.com.');
+    if (!isGmail(sender)) throw new SystemMailError('SYSTEM_SENDER_NOT_GMAIL', 'The system sender must use Gmail (OAuth2 or app password) and smtp.gmail.com.');
     if (sender.status !== 'active') throw new SystemMailError('SYSTEM_SENDER_PAUSED', 'The configured Gmail sender is paused. Verify SMTP to activate it.');
     if (!isVerified(sender)) throw new SystemMailError('SYSTEM_SENDER_UNVERIFIED', 'Verify the configured Gmail sender with Verify SMTP before sending account emails.');
     return { id, sender };
@@ -75,10 +86,18 @@ function createSystemMailer({ db, auth, encryptionKey, senderId = process.env.SY
     let secret;
     try { secret = decryptCredentials(encryptionKey, selected.id, selected.sender.credentials); }
     catch { throw new SystemMailError('SENDER_DECRYPTION_FAILED', 'The Gmail credentials cannot be opened with the current encryption key. Restore the original key or save the app password again.'); }
-    if (secret.type !== 'app_password' || !/^[a-z]{16}$/i.test(String(secret.password || '').replace(/\s+/g, '')) || String(secret.host || 'smtp.gmail.com').toLowerCase() !== 'smtp.gmail.com') {
-      throw new SystemMailError('GMAIL_APP_PASSWORD_INVALID', 'Save a valid 16-letter Gmail app password and verify SMTP again.', 400);
+    if (secret.type === 'oauth2') {
+      if (!secret.refreshToken || !secret.clientId || !secret.clientSecret) {
+        throw new SystemMailError('GMAIL_OAUTH_INVALID', 'The connected Gmail OAuth sender is missing refresh tokens. Reconnect Gmail in Admin senders.', 400);
+      }
+    } else if (secret.type === 'app_password') {
+      if (!/^[a-z]{16}$/i.test(String(secret.password || '').replace(/\s+/g, '')) || String(secret.host || 'smtp.gmail.com').toLowerCase() !== 'smtp.gmail.com') {
+        throw new SystemMailError('GMAIL_APP_PASSWORD_INVALID', 'Save a valid 16-letter Gmail app password and verify SMTP again.', 400);
+      }
+      secret.password = secret.password.replace(/\s+/g, '');
+    } else {
+      throw new SystemMailError('GMAIL_CREDENTIALS_INVALID', 'Gmail sender must use either OAuth2 or a 16-letter app password.', 400);
     }
-    secret.password = secret.password.replace(/\s+/g, '');
     return { ...selected, secret };
   }
 

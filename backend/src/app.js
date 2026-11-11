@@ -303,11 +303,15 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
     const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
     const mobile = typeof req.body?.mobile === 'string' ? req.body.mobile.trim() : (typeof req.body?.phone === 'string' ? req.body.phone.trim() : '');
 
+    const isGoogleProvider = Boolean(req.user?.firebase?.sign_in_provider === 'google.com' || req.user?.firebase?.sign_in_provider === 'google' || req.body?.authProvider === 'google');
     const ref = profile(req.user.uid);
     const result = await ref.transaction(existing => {
       if (existing) {
         existing.email = req.user.email;
         existing.emailVerified = emailVerified;
+        if (!existing.authProvider) {
+          existing.authProvider = isGoogleProvider ? 'google' : 'password';
+        }
         if (name && !existing.name) existing.name = name;
         if (username && !existing.username) existing.username = username;
         if (mobile && !existing.mobile) existing.mobile = mobile;
@@ -318,6 +322,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
       const doc = {
         email: req.user.email,
         emailVerified,
+        authProvider: isGoogleProvider ? 'google' : 'password',
         name: name || '',
         username: username || '',
         mobile: mobile || '',
@@ -2023,33 +2028,37 @@ CRITICAL RULES:
     }
     let senderId = null;
     const assignment = (await db.ref('sender_assignments/' + req.uid).get()).val();
-    if (safeId(assignment?.senderId) && assignment?.manual === true) {
+    const sendersSnap = await db.ref('sender_accounts').get();
+    const sendersVal = sendersSnap.val() || {};
+    const activeSenderEntries = Object.entries(sendersVal).filter(([_, s]) => s && s.status === 'active');
+    const configuredSysId = sendingConfig.systemSenderId || process.env.SYSTEM_SENDER_ID;
+
+    if (safeId(assignment?.senderId) && assignment?.manual === true && sendersVal[assignment.senderId]?.status === 'active') {
       senderId = assignment.senderId;
-    } else if (sendingConfig.systemSenderId || process.env.SYSTEM_SENDER_ID) {
-      const selected = await accountMailer.getSender();
-      senderId = selected.id;
-    } else {
-      const sendersSnap = await db.ref('sender_accounts').get();
-      const sendersVal = sendersSnap.val() || {};
-      const activeSenderEntries = Object.entries(sendersVal).filter(([_, s]) => s && s.status === 'active');
-      if (activeSenderEntries.length > 0) {
-        // Multi-account Round-Robin load balancing across all connected admin sender accounts (Gmail, Brevo, SMTP)
-        activeSenderEntries.sort(([a], [b]) => a.localeCompare(b));
-        let rotationIdx = 0;
-        try {
-          const rotRef = db.ref('system_runtime/sender_rotation_counter');
-          const rotRes = await rotRef.transaction(c => Number.isSafeInteger(c) ? c + 1 : 0);
-          if (rotRes.committed) {
-            rotationIdx = rotRes.snapshot.val() || 0;
-          }
-        } catch {
-          rotationIdx = Math.floor(Math.random() * activeSenderEntries.length);
+    } else if (configuredSysId && sendersVal[configuredSysId]?.status === 'active') {
+      senderId = configuredSysId;
+    } else if (activeSenderEntries.length > 0) {
+      // Multi-account Round-Robin load balancing across all connected admin sender accounts (Gmail, Brevo, SMTP)
+      activeSenderEntries.sort(([a], [b]) => a.localeCompare(b));
+      let rotationIdx = 0;
+      try {
+        const rotRef = db.ref('system_runtime/sender_rotation_counter');
+        const rotRes = await rotRef.transaction(c => Number.isSafeInteger(c) ? c + 1 : 0);
+        if (rotRes.committed) {
+          rotationIdx = rotRes.snapshot.val() || 0;
         }
-        const selected = activeSenderEntries[rotationIdx % activeSenderEntries.length];
-        senderId = selected[0];
-      } else if (safeId(assignment?.senderId)) {
-        senderId = assignment.senderId;
+      } catch {
+        rotationIdx = Math.floor(Math.random() * activeSenderEntries.length);
       }
+      const selected = activeSenderEntries[rotationIdx % activeSenderEntries.length];
+      senderId = selected[0];
+    } else if (safeId(assignment?.senderId)) {
+      senderId = assignment.senderId;
+    } else if (configuredSysId) {
+      try {
+        const selected = await accountMailer.getSender();
+        senderId = selected.id;
+      } catch {}
     }
     if (!safeId(senderId)) return fail(res, 503, 'SENDER_UNAVAILABLE', 'No approved sender is assigned. An administrator must register and authorize an active sender account.');
     const r = await reserve(db, req.uid, header || body, message, senderId);
