@@ -46,6 +46,27 @@ function createGoogleOAuthRoutes({
     return `${proto}://${host}`;
   };
 
+  // Base URL of the browser-facing client app. When the frontend is hosted
+  // separately from this backend (e.g. static hosting + serverless API), OAuth
+  // callbacks must send the browser back to the frontend, not to the API host.
+  // Set FRONTEND_URL (or CLIENT_ORIGIN) to enable cross-origin redirects.
+  // Leaving it unset preserves the original same-origin behaviour.
+  const getFrontendBaseUrl = () => {
+    const configured = (process.env.FRONTEND_URL || process.env.CLIENT_ORIGIN || '').trim();
+    return configured ? configured.replace(/\/+$/, '') : '';
+  };
+
+  // Build a browser-facing redirect target. `path` always starts with '/'.
+  // Local development always stays same-origin so a production FRONTEND_URL
+  // in .env cannot bounce localhost logins to the deployed site.
+  const clientRedirect = (path, req) => {
+    const host = req ? (req.get('x-forwarded-host') || req.get('host') || '') : '';
+    const isLocal = /^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(host);
+    if (isLocal) return path;
+    const frontendBase = getFrontendBaseUrl();
+    return frontendBase ? `${frontendBase}${path}` : path;
+  };
+
   const getGoogleAuthRedirectUri = req => {
     const baseUrl = getBaseUrl(req);
     if (baseUrl.includes('indiamail.toolsnetwork.online')) {
@@ -120,7 +141,7 @@ function createGoogleOAuthRoutes({
       res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
     } catch (err) {
       console.error('[GOOGLE SIGN-IN START ERROR]', err);
-      res.redirect(`/account.html?error=${encodeURIComponent('Failed to initiate Google Sign-In')}`);
+      res.redirect(clientRedirect(`/account.html?error=${encodeURIComponent('Failed to initiate Google Sign-In')}`, req));
     }
   });
 
@@ -137,11 +158,11 @@ function createGoogleOAuthRoutes({
 
     if (error) {
       console.warn('[GOOGLE SIGN-IN ERROR]', error);
-      return res.redirect(`/account.html?error=${encodeURIComponent('Google sign-in was cancelled or denied.')}`);
+      return res.redirect(clientRedirect(`/account.html?error=${encodeURIComponent('Google sign-in was cancelled or denied.')}`, req));
     }
 
     if (!code || !state) {
-      return res.redirect(`/account.html?error=${encodeURIComponent('Missing authorization code or state parameter.')}`);
+      return res.redirect(clientRedirect(`/account.html?error=${encodeURIComponent('Missing authorization code or state parameter.')}`, req));
     }
 
     try {
@@ -152,7 +173,7 @@ function createGoogleOAuthRoutes({
 
       if (!stateRecord || stateRecord.type !== 'google_signin' || Date.now() > stateRecord.expiresAt) {
         console.warn('[GOOGLE OAUTH INVALID STATE]', { stateFound: Boolean(stateRecord) });
-        return res.redirect(`/account.html?error=${encodeURIComponent('Invalid or expired OAuth state. Please try signing in again.')}`);
+        return res.redirect(clientRedirect(`/account.html?error=${encodeURIComponent('Invalid or expired OAuth state. Please try signing in again.')}`, req));
       }
 
       const redirectUri = stateRecord.redirectUri || getGoogleAuthRedirectUri(req);
@@ -342,10 +363,10 @@ function createGoogleOAuthRoutes({
       // Redirect to dashboard with welcome toast, session token and gmail connected flag if applicable
       const gmailParam = gmailLinked ? '&gmail=connected' : '';
       const tokenParam = `&token=${encodeURIComponent(sessionCookie)}`;
-      res.redirect(`/dashboard.html?auth=google_success${isNewUser ? '&welcome=1' : ''}${tokenParam}${gmailParam}`);
+      res.redirect(clientRedirect(`/dashboard.html?auth=google_success${isNewUser ? '&welcome=1' : ''}${tokenParam}${gmailParam}`, req));
     } catch (err) {
       console.error('[GOOGLE OAUTH CALLBACK ERROR]', err.message);
-      res.redirect(`/account.html?error=${encodeURIComponent(err.message || 'Google authentication failed.')}`);
+      res.redirect(clientRedirect(`/account.html?error=${encodeURIComponent(err.message || 'Google authentication failed.')}`, req));
     }
   });
 
@@ -371,7 +392,7 @@ function createGoogleOAuthRoutes({
     } catch {}
 
     if (!uid) {
-      return res.redirect(`/account.html?msg=${encodeURIComponent('Please sign in before connecting your Gmail account.')}`);
+      return res.redirect(clientRedirect(`/account.html?msg=${encodeURIComponent('Please sign in before connecting your Gmail account.')}`, req));
     }
 
     try {
@@ -401,7 +422,7 @@ function createGoogleOAuthRoutes({
       res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
     } catch (err) {
       console.error('[GMAIL CONNECT START ERROR]', err);
-      res.redirect(`/dashboard.html?error=${encodeURIComponent('Failed to initiate Gmail connection.')}`);
+      res.redirect(clientRedirect(`/dashboard.html?error=${encodeURIComponent('Failed to initiate Gmail connection.')}`, req));
     }
   });
 
@@ -411,11 +432,11 @@ function createGoogleOAuthRoutes({
 
     if (error) {
       console.warn('[GMAIL OAUTH DENIED]', error);
-      return res.redirect(`/dashboard.html?error=${encodeURIComponent('Gmail connection authorization was cancelled.')}`);
+      return res.redirect(clientRedirect(`/dashboard.html?error=${encodeURIComponent('Gmail connection authorization was cancelled.')}`, req));
     }
 
     if (!code || !state) {
-      return res.redirect(`/dashboard.html?error=${encodeURIComponent('Missing authorization code or state parameter.')}`);
+      return res.redirect(clientRedirect(`/dashboard.html?error=${encodeURIComponent('Missing authorization code or state parameter.')}`, req));
     }
 
     try {
@@ -425,7 +446,7 @@ function createGoogleOAuthRoutes({
       await db.ref(`oauth_states/${state}`).set(null); // Invalidate state
 
       if (!stateRecord || stateRecord.type !== 'gmail_connect' || !stateRecord.uid || Date.now() > stateRecord.expiresAt) {
-        return res.redirect(`/dashboard.html?error=${encodeURIComponent('Invalid or expired Gmail connection state. Please try again.')}`);
+        return res.redirect(clientRedirect(`/dashboard.html?error=${encodeURIComponent('Invalid or expired Gmail connection state. Please try again.')}`, req));
       }
 
       const uid = stateRecord.uid;
@@ -478,7 +499,7 @@ function createGoogleOAuthRoutes({
             status: 'active',
             lastRefreshedAt: Date.now()
           });
-          return res.redirect(`/dashboard.html?gmail=connected&email=${encodeURIComponent(connectedEmail)}`);
+          return res.redirect(clientRedirect(`/dashboard.html?gmail=connected&email=${encodeURIComponent(connectedEmail)}`, req));
         } else {
           throw new Error('Google did not provide an offline refresh token. Please click Connect Gmail and ensure all permissions are granted.');
         }
@@ -503,10 +524,10 @@ function createGoogleOAuthRoutes({
       });
 
       console.log(`[GMAIL CONNECTED] Successfully connected ${connectedEmail} for user ${uid}`);
-      res.redirect(`/dashboard.html?gmail=connected&email=${encodeURIComponent(connectedEmail)}`);
+      res.redirect(clientRedirect(`/dashboard.html?gmail=connected&email=${encodeURIComponent(connectedEmail)}`, req));
     } catch (err) {
       console.error('[GMAIL OAUTH CALLBACK ERROR]', err.message);
-      res.redirect(`/dashboard.html?error=${encodeURIComponent(err.message || 'Gmail connection failed.')}`);
+      res.redirect(clientRedirect(`/dashboard.html?error=${encodeURIComponent(err.message || 'Gmail connection failed.')}`, req));
     }
   });
 
