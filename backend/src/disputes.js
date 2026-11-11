@@ -109,6 +109,7 @@ async function attemptCreditRecovery(db, uid, disputeId, creditsDisputed, amount
   let outcome = RECOVERY_STATUSES.MANUAL_REVIEW_REQUIRED;
 
   const result = await db.ref('wallets/' + uid).transaction(wallet => {
+    if (wallet === null) return null;
     wallet = wallet || { balance: 0, reserved: 0, purchased: 0, consumed: 0 };
     wallet.ledger = wallet.ledger || {};
 

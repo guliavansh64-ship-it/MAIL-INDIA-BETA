@@ -138,6 +138,7 @@ async function applyRefundState({ db, refundRecord, order }) {
     // Credit Recovery in Wallet Transaction
     let recoveryOutcome = 'manual_review_required';
     const result = await db.ref('wallets/' + uid).transaction(wallet => {
+      if (wallet === null) return null;
       wallet = wallet || { balance: 0, reserved: 0, purchased: 0, consumed: 0 };
       wallet.ledger = wallet.ledger || {};
 

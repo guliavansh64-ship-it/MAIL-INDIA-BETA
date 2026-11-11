@@ -9,3 +9,28 @@ test('pre-send failure releases credit; uncertain send never retries or refunds'
 test('quota exhaustion prevents provider call and releases reservation',async()=>{let db=setup(),m=normalize({to:'a@example.com',subject:'Hi',text:'Hello',consent:true}),r=await reserve(db,'alice','quota',m,'sender1');db.root.sender_accounts.sender1.dailyLimit=1;db.root.sender_accounts.sender1.usage={[new Date().toISOString().slice(0,10)]:1};await runJob({db,key,uid:'alice',id:r.id,send:async()=>{throw Error('must not send')}});assert.equal(db.root.wallets.alice.balance,2);assert.equal(db.root.wallets.alice.sendRequests[r.id].error,'SENDER_QUOTA_EXCEEDED')});
 test('suspended user queued sends fail before SMTP and release reservation',async()=>{let db=setup(),m=normalize({to:'a@example.com',subject:'Hi',text:'Hello',consent:true});let r=await reserve(db,'alice','suspension',m,'sender1');db.root.users.alice.status='suspended';let calls=0;await runJob({db,key,uid:'alice',id:r.id,send:async()=>{calls++;return {accepted:['a@example.com']}}});assert.equal(calls,0);assert.equal(db.root.wallets.alice.balance,2);assert.equal(db.root.wallets.alice.sendRequests[r.id].error,'USER_SUSPENDED')});
 test('suppression checked before SMTP releases credit without sending',async()=>{let db=setup(),m=normalize({to:'a@example.com',subject:'Hi',text:'Hello',consent:true}),r=await reserve(db,'alice','suppressed',m,'sender1');db.root.suppression_list={[crypto.createHash('sha256').update(m.to).digest('hex')]:{reason:'complaint'}};let calls=0;await runJob({db,key,uid:'alice',id:r.id,send:async()=>{calls++;return {accepted:[m.to]}}});assert.equal(calls,0);assert.equal(db.root.wallets.alice.balance,2);assert.equal(db.root.wallets.alice.sendRequests[r.id].error,'RECIPIENT_SUPPRESSED')});
+test('reserve and transition handle initial null transaction state like real Firebase RTDB', async () => {
+  let root = { wallets: { bob: { balance: 5, reserved: 0, purchased: 5, consumed: 0 } } };
+  let db = {
+    ref(p) {
+      return {
+        async get() { return { val: () => structuredClone(root.wallets?.bob) }; },
+        async set(v) {},
+        async transaction(fn) {
+          let v1 = fn(null);
+          if (v1 === undefined) return { committed: false };
+          let v2 = fn(structuredClone(root.wallets.bob));
+          if (v2 === undefined) return { committed: false };
+          root.wallets.bob = v2;
+          return { committed: true, snapshot: { val: () => structuredClone(v2) } };
+        }
+      };
+    }
+  };
+  let m = normalize({ to: 'bob@example.com', subject: 'Test', text: 'Hello', consent: true });
+  let res = await reserve(db, 'bob', 'order-firebase-sim', m, 'sender1');
+  assert.ok(res.id);
+  assert.equal(res.error, undefined);
+  assert.equal(root.wallets.bob.balance, 4);
+  assert.equal(root.wallets.bob.reserved, 1);
+});

@@ -97,6 +97,7 @@ async function autoRecoverStuckJobs(db, timeoutMs = DEFAULT_STUCK_TIMEOUT_MS) {
 
     // Move stuck processing job to 'unknown' to avoid indefinite lock and ambiguity
     const result = await db.ref('wallets/' + uid).transaction(w => {
+      if (w === null) return null;
       const j = w?.sendRequests?.[id];
       if (!j || j.status !== 'processing') return;
       j.status = 'unknown';
@@ -138,6 +139,7 @@ async function moveToDLQ(db, { uid, id, error, details, adminId }) {
   await db.ref('queue_dlq/' + id).set(dlqEntry);
 
   await db.ref('wallets/' + uid).transaction(w => {
+    if (w === null) return null;
     const j = w?.sendRequests?.[id];
     if (!j) return;
     j.status = 'dead_letter';
@@ -191,6 +193,7 @@ async function manualRecoverJob({ db, sendQueue, uid, id, action, outcome, evide
 
     let released = false;
     await db.ref('wallets/' + uid).transaction(w => {
+      if (w === null) return null;
       const j = w?.sendRequests?.[id];
       if (!j) return;
       if (j.status === 'failed') return w; // already released
@@ -230,6 +233,7 @@ async function manualRecoverJob({ db, sendQueue, uid, id, action, outcome, evide
 
     let changed = false;
     await db.ref('wallets/' + uid).transaction(w => {
+      if (w === null) return null;
       const j = w?.sendRequests?.[id];
       if (!j || j.status !== 'unknown' || !Number.isSafeInteger(w.reserved) || w.reserved < 1) return;
 

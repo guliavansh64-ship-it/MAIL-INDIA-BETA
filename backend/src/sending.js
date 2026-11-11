@@ -51,6 +51,7 @@ const safeId=id=>typeof id==='string'&&/^[A-Za-z0-9_-]{1,128}$/.test(id);
 async function reserve(db,uid,idempotencyKey,message,senderId){
   const id=sha(idempotencyKey),fingerprint=sha(JSON.stringify(message)),now=Date.now(),ref=db.ref('wallets/'+uid);
   let result=await ref.transaction(w=>{
+    if(w===null)return null;
     w=w||{balance:0,reserved:0,purchased:0,consumed:0};
     w.sendRequests=w.sendRequests||{};
     let prior=w.sendRequests[id];
@@ -63,7 +64,7 @@ async function reserve(db,uid,idempotencyKey,message,senderId){
     w.ledger['reserve_'+id]={type:'reserve',credits:-1,reference:id,createdAt:now};
     return w;
   },undefined,false);
-  if(!result.committed)return {error:'INSUFFICIENT_CREDITS'};
+  if(!result.committed||!result.snapshot?.val()?.sendRequests?.[id])return {error:'INSUFFICIENT_CREDITS'};
   let job=result.snapshot.val().sendRequests[id];
   if(job.fingerprint!==fingerprint)return {error:'IDEMPOTENCY_CONFLICT'};
   await projectLog(db,uid,job);
@@ -73,6 +74,7 @@ async function reserve(db,uid,idempotencyKey,message,senderId){
 async function transition(db,uid,id,from,to,detail={}){
   let changed=false,now=Date.now();
   let result=await db.ref('wallets/'+uid).transaction(w=>{
+    if(w===null)return null;
     changed=false;
     let job=w?.sendRequests?.[id];
     if(!job||!from.includes(job.status))return;
