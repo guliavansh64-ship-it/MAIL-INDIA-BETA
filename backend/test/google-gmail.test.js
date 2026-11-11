@@ -19,7 +19,8 @@ function memoryDb() {
   const root = {
     users: {
       userA: { uid: 'userA', email: 'alice@example.com', status: 'active', email_verified: true, name: 'Alice' },
-      userB: { uid: 'userB', email: 'bob@example.com', status: 'active', email_verified: true, name: 'Bob' }
+      userB: { uid: 'userB', email: 'bob@example.com', status: 'active', email_verified: true, name: 'Bob' },
+      adminUid: { uid: 'adminUid', email: 'guliavansh64@gmail.com', status: 'active', email_verified: true, name: 'Admin', admin: true }
     },
     wallets: {
       userA: { balance: 10, reserved: 0, purchased: 10, consumed: 0, sendRequests: {} },
@@ -87,11 +88,13 @@ const fakeAuth = {
   async verifyIdToken(token) {
     if (token === 'userA') return { uid: 'userA', email: 'alice@example.com', email_verified: true };
     if (token === 'userB') return { uid: 'userB', email: 'bob@example.com', email_verified: true };
+    if (token === 'adminUser') return { uid: 'adminUid', email: 'guliavansh64@gmail.com', email_verified: true, admin: true };
     throw new Error('invalid id token');
   },
   async verifySessionCookie(cookie) {
     if (cookie === 'session_userA') return { uid: 'userA', email: 'alice@example.com', email_verified: true };
     if (cookie === 'session_userB') return { uid: 'userB', email: 'bob@example.com', email_verified: true };
+    if (cookie === 'session_admin') return { uid: 'adminUid', email: 'guliavansh64@gmail.com', email_verified: true, admin: true };
     if (cookie.startsWith('session_google_')) {
       const uid = cookie.replace('session_', '');
       return { uid, email: 'newuser@gmail.com', email_verified: true };
@@ -627,6 +630,199 @@ test('Credentials and secrets are strictly backend-only and never exposed in res
   assert.ok(!statusStr.includes('GOOGLE_CLIENT_SECRET'));
   assert.ok(!statusStr.includes('encryptedRefreshToken'));
   assert.ok(!statusStr.includes('refreshToken'));
+});
+
+test('Admin 1-Click Gmail Connect: Non-admin is rejected from initiating connect', async () => {
+  const db = memoryDb();
+  const app = createApp({ db, auth: fakeAuth, sendingConfig: { encryptionKey: encKey } });
+
+  // Unauthenticated request redirects
+  const res1 = await request(app).get('/oauth/admin/gmail/connect');
+  assert.equal(res1.status, 302);
+  assert.ok(res1.headers.location.includes('/account.html?error='));
+
+  // Non-admin user redirects
+  const res2 = await request(app)
+    .get('/oauth/admin/gmail/connect')
+    .set('Cookie', 'mb_session=session_userA');
+  assert.equal(res2.status, 302);
+  assert.ok(res2.headers.location.includes('/account.html?error='));
+
+  // JSON request returns 401
+  const res3 = await request(app)
+    .get('/api/admin/oauth/gmail/connect')
+    .set('Accept', 'application/json');
+  assert.equal(res3.status, 401);
+});
+
+test('Admin 1-Click Gmail Connect: Admin initiates OAuth, sets state, and redirects with account picker and scopes', async () => {
+  const db = memoryDb();
+  const app = createApp({ db, auth: fakeAuth, sendingConfig: { encryptionKey: encKey } });
+
+  const res = await request(app)
+    .get('/oauth/admin/gmail/connect')
+    .set('Cookie', 'mb_session=session_admin');
+
+  assert.equal(res.status, 302);
+  const location = new URL(res.headers.location);
+  assert.equal(location.host, 'accounts.google.com');
+  assert.equal(location.searchParams.get('client_id'), 'test-google-client-id');
+  assert.equal(location.searchParams.get('access_type'), 'offline');
+  assert.equal(location.searchParams.get('prompt'), 'consent select_account');
+  const scope = location.searchParams.get('scope');
+  assert.ok(scope.includes('https://mail.google.com/'));
+  assert.ok(scope.includes('https://www.googleapis.com/auth/gmail.send'));
+
+  const state = location.searchParams.get('state');
+  assert.ok(state);
+  const stateRecord = (await db.ref(`oauth_states/${state}`).get()).val();
+  assert.equal(stateRecord.type, 'admin_gmail_connect');
+  assert.equal(stateRecord.adminUid, 'adminUid');
+  assert.equal(stateRecord.adminEmail, 'guliavansh64@gmail.com');
+});
+
+test('Admin 1-Click Gmail Connect: Callback exchanges code, adds active sender to sender_accounts pool, and logs audit', async () => {
+  const db = memoryDb();
+  const app = createApp({ db, auth: fakeAuth, sendingConfig: { encryptionKey: encKey } });
+
+  const state = 'test_admin_state_123';
+  await db.ref(`oauth_states/${state}`).set({
+    type: 'admin_gmail_connect',
+    adminUid: 'adminUid',
+    adminEmail: 'guliavansh64@gmail.com',
+    redirectUri: 'http://localhost:3000/oauth/oauth/gmail/callback',
+    createdAt: Date.now(),
+    expiresAt: Date.now() + 600000
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const s = url.toString();
+    if (s.includes('oauth2.googleapis.com/token')) {
+      return {
+        ok: true,
+        json: async () => ({
+          access_token: 'mock-admin-access-token',
+          refresh_token: '1//mock-admin-refresh-token-xyz'
+        })
+      };
+    }
+    if (s.includes('googleapis.com/oauth2/v2/userinfo')) {
+      return {
+        ok: true,
+        json: async () => ({
+          id: 'google-admin-sender-1',
+          email: 'dispatch.admin@gmail.com',
+          name: 'Dispatch Admin Sender'
+        })
+      };
+    }
+    throw new Error('unexpected: ' + s);
+  };
+
+  try {
+    const cbRes = await request(app).get(`/oauth/gmail/callback?code=mock_code&state=${state}`);
+    assert.equal(cbRes.status, 302);
+    assert.ok(cbRes.headers.location.includes('/admin/senders.html?sender_connected=success'));
+    assert.ok(cbRes.headers.location.includes('dispatch.admin%40gmail.com'));
+
+    // Check sender_accounts in db
+    const sendersSnap = await db.ref('sender_accounts').get();
+    const senders = Object.values(sendersSnap.val() || {});
+    assert.equal(senders.length, 1);
+    const sender = senders[0];
+    assert.equal(sender.email, 'dispatch.admin@gmail.com');
+    assert.equal(sender.name, 'Dispatch Admin Sender');
+    assert.equal(sender.provider, 'gmail_oauth');
+    assert.equal(sender.authType, 'oauth2');
+    assert.equal(sender.status, 'active');
+    assert.ok(Number.isFinite(sender.verifiedAt) && sender.verifiedAt > 0);
+    assert.equal(sender.dailyLimit, 500);
+
+    // Verify encrypted credentials can be decrypted
+    const { decryptCredentials } = require('../src/sending');
+    const secret = decryptCredentials(encKey, sender.id, sender.credentials);
+    assert.equal(secret.type, 'oauth2');
+    assert.equal(secret.clientId, 'test-google-client-id');
+    assert.equal(secret.clientSecret, 'test-google-client-secret');
+    assert.equal(secret.refreshToken, '1//mock-admin-refresh-token-xyz');
+    assert.equal(secret.host, 'smtp.gmail.com');
+    assert.equal(secret.port, 465);
+
+    // Verify state was consumed
+    const consumedState = (await db.ref(`oauth_states/${state}`).get()).val();
+    assert.ok(!consumedState);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Admin 1-Click Gmail Connect: Multiple Gmail accounts can be connected for multi-sender rotation pool', async () => {
+  const db = memoryDb();
+  const app = createApp({ db, auth: fakeAuth, sendingConfig: { encryptionKey: encKey } });
+
+  const originalFetch = globalThis.fetch;
+  try {
+    // Connect Sender 1
+    const state1 = 'state_sender_1';
+    await db.ref(`oauth_states/${state1}`).set({
+      type: 'admin_gmail_connect',
+      adminUid: 'adminUid',
+      adminEmail: 'guliavansh64@gmail.com',
+      redirectUri: 'http://localhost:3000/oauth/oauth/gmail/callback',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 600000
+    });
+
+    globalThis.fetch = async (url) => {
+      const s = url.toString();
+      if (s.includes('oauth2.googleapis.com/token')) {
+        return { ok: true, json: async () => ({ access_token: 'token1', refresh_token: 'rt1' }) };
+      }
+      if (s.includes('googleapis.com/oauth2/v2/userinfo')) {
+        return { ok: true, json: async () => ({ id: 'g1', email: 'sender1@gmail.com', name: 'Pool Sender One' }) };
+      }
+      throw new Error('unexpected: ' + s);
+    };
+
+    const res1 = await request(app).get(`/oauth/gmail/callback?code=code1&state=${state1}`);
+    assert.equal(res1.status, 302);
+
+    // Connect Sender 2
+    const state2 = 'state_sender_2';
+    await db.ref(`oauth_states/${state2}`).set({
+      type: 'admin_gmail_connect',
+      adminUid: 'adminUid',
+      adminEmail: 'guliavansh64@gmail.com',
+      redirectUri: 'http://localhost:3000/oauth/oauth/gmail/callback',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 600000
+    });
+
+    globalThis.fetch = async (url) => {
+      const s = url.toString();
+      if (s.includes('oauth2.googleapis.com/token')) {
+        return { ok: true, json: async () => ({ access_token: 'token2', refresh_token: 'rt2' }) };
+      }
+      if (s.includes('googleapis.com/oauth2/v2/userinfo')) {
+        return { ok: true, json: async () => ({ id: 'g2', email: 'sender2@gmail.com', name: 'Pool Sender Two' }) };
+      }
+      throw new Error('unexpected: ' + s);
+    };
+
+    const res2 = await request(app).get(`/oauth/gmail/callback?code=code2&state=${state2}`);
+    assert.equal(res2.status, 302);
+
+    // Check that BOTH senders exist in sender_accounts
+    const sendersSnap = await db.ref('sender_accounts').get();
+    const senders = Object.values(sendersSnap.val() || {});
+    assert.equal(senders.length, 2);
+    const emails = senders.map(s => s.email).sort();
+    assert.deepEqual(emails, ['sender1@gmail.com', 'sender2@gmail.com']);
+    assert.ok(senders.every(s => s.status === 'active' && s.authType === 'oauth2'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 

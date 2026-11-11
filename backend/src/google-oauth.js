@@ -375,8 +375,104 @@ function createGoogleOAuthRoutes({
   });
 
   // -------------------------------------------------------------
-  // 2. CONNECT GMAIL (GMAIL API SENDING) FLOW
+  // 2. CONNECT GMAIL (GMAIL API SENDING & ADMIN SENDER POOL) FLOW
   // -------------------------------------------------------------
+
+  const authenticateAdmin = async (req) => {
+    let uid = null;
+    let email = null;
+    let emailVerified = false;
+
+    const jar = getCookies(req);
+    const queryToken = req.query?.token;
+    const authHeader = req.get('authorization') || '';
+    const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    const token = jar['__Host-mb_session'] || jar['mb_session'] || queryToken || bearerToken || '';
+
+    if (token) {
+      let decoded = await auth.verifySessionCookie(token, true).catch(() => null);
+      if (!decoded) decoded = await auth.verifyIdToken(token, true).catch(() => null);
+      if (decoded && decoded.uid) {
+        uid = decoded.uid;
+        email = decoded.email;
+        emailVerified = decoded.email_verified === true;
+      }
+    }
+
+    if (!uid) return { ok: false, status: 401, error: 'UNAUTHENTICATED', message: 'Authentication required.' };
+    if (!emailVerified) return { ok: false, status: 403, error: 'EMAIL_NOT_VERIFIED', message: 'Email verification required.' };
+
+    const adminEmails = (process.env.ADMIN_EMAILS || 'guliavansh64@gmail.com').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    const userEmail = (email || '').toLowerCase();
+    const isGmail = userEmail.endsWith('@gmail.com');
+
+    // Strict rule: all Gmail cannot be admin except strictly guliavansh64@gmail.com
+    if (isGmail && userEmail !== 'guliavansh64@gmail.com') {
+      return { ok: false, status: 403, error: 'ADMIN_REQUIRED', message: 'Administrator privileges are required.' };
+    }
+
+    const isExplicitAdmin = userEmail === 'guliavansh64@gmail.com' || (!isGmail && adminEmails.includes(userEmail));
+    let profile = null;
+    try {
+      profile = (await db.ref('users/' + uid).get()).val();
+    } catch {}
+
+    const isAdmin = isExplicitAdmin || (!isGmail && profile && (profile.admin || profile.role === 'admin'));
+    if (!isAdmin) {
+      return { ok: false, status: 403, error: 'ADMIN_REQUIRED', message: 'Administrator privileges are required.' };
+    }
+
+    return { ok: true, user: { uid, email: userEmail, admin: true } };
+  };
+
+  // GET /oauth/admin/gmail/connect & /api/admin/oauth/gmail/connect (Admin 1-Click Connect for Sender Pool)
+  router.get(['/oauth/admin/gmail/connect', '/api/admin/oauth/gmail/connect', '/oauth/oauth/admin/gmail/connect'], async (req, res) => {
+    const authResult = await authenticateAdmin(req);
+    if (!authResult.ok) {
+      const isJson = req.xhr || (req.get('accept') && req.get('accept').includes('application/json'));
+      if (isJson) {
+        return res.status(authResult.status).json({ success: false, error: authResult.error, message: authResult.message });
+      }
+      return res.redirect(clientRedirect(`/account.html?error=${encodeURIComponent(authResult.message || 'Administrator authentication required.')}`, req));
+    }
+
+    try {
+      const state = crypto.randomBytes(24).toString('hex');
+      const redirectUri = getGmailRedirectUri(req);
+      const clientId = getClientId();
+
+      // Store state bound to this admin session with 15-minute TTL
+      await db.ref(`oauth_states/${state}`).set({
+        type: 'admin_gmail_connect',
+        adminUid: authResult.user.uid,
+        adminEmail: authResult.user.email,
+        redirectUri,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + (15 * 60 * 1000)
+      });
+
+      const params = new URLSearchParams({
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        scope: 'openid email profile https://mail.google.com/ https://www.googleapis.com/auth/gmail.send',
+        access_type: 'offline',
+        prompt: 'consent select_account',
+        state
+      });
+
+      const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+
+      const isJson = req.xhr || (req.get('accept') && req.get('accept').includes('application/json'));
+      if (isJson) {
+        return res.json({ success: true, url: authUrl });
+      }
+      res.redirect(authUrl);
+    } catch (err) {
+      console.error('[ADMIN GMAIL CONNECT START ERROR]', err);
+      res.redirect(clientRedirect(`/admin/senders.html?error=${encodeURIComponent('Failed to initiate Gmail connection.')}`, req));
+    }
+  });
 
   // GET /oauth/gmail/connect & /oauth/oauth/gmail/connect (Must be authenticated)
   router.get(['/oauth/gmail/connect', '/oauth/oauth/gmail/connect'], async (req, res) => {
@@ -441,23 +537,141 @@ function createGoogleOAuthRoutes({
 
     if (error) {
       console.warn('[GMAIL OAUTH DENIED]', error);
-      return res.redirect(clientRedirect(`/dashboard.html?error=${encodeURIComponent('Gmail connection authorization was cancelled.')}`, req));
+      let isAdminFlow = false;
+      if (state) {
+        try {
+          const sSnap = await db.ref(`oauth_states/${state}`).get();
+          if (sSnap.val()?.type === 'admin_gmail_connect') isAdminFlow = true;
+          await db.ref(`oauth_states/${state}`).set(null);
+        } catch {}
+      }
+      const redirectTarget = isAdminFlow ? '/admin/senders.html' : '/dashboard.html';
+      return res.redirect(clientRedirect(`${redirectTarget}?error=${encodeURIComponent('Gmail connection authorization was cancelled or denied.')}`, req));
     }
 
     if (!code || !state) {
       return res.redirect(clientRedirect(`/dashboard.html?error=${encodeURIComponent('Missing authorization code or state parameter.')}`, req));
     }
 
+    let stateRecord = null;
     try {
       // Validate state
       const stateSnap = await db.ref(`oauth_states/${state}`).get();
-      const stateRecord = stateSnap.val();
+      stateRecord = stateSnap.val();
       await db.ref(`oauth_states/${state}`).set(null); // Invalidate state
 
-      if (!stateRecord || stateRecord.type !== 'gmail_connect' || !stateRecord.uid || Date.now() > stateRecord.expiresAt) {
-        return res.redirect(clientRedirect(`/dashboard.html?error=${encodeURIComponent('Invalid or expired Gmail connection state. Please try again.')}`, req));
+      if (!stateRecord || (stateRecord.type !== 'gmail_connect' && stateRecord.type !== 'admin_gmail_connect') || Date.now() > stateRecord.expiresAt) {
+        const isAdmin = stateRecord?.type === 'admin_gmail_connect';
+        return res.redirect(clientRedirect(`${isAdmin ? '/admin/senders.html' : '/dashboard.html'}?error=${encodeURIComponent('Invalid or expired Gmail connection state. Please try again.')}`, req));
       }
 
+      // Handle Admin 1-Click Gmail Connect Flow
+      if (stateRecord.type === 'admin_gmail_connect') {
+        const redirectUri = stateRecord.redirectUri || getGmailRedirectUri(req);
+        const clientId = getClientId();
+        const clientSecret = getClientSecret();
+
+        // Exchange code for access & refresh tokens
+        const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            code,
+            client_id: clientId,
+            client_secret: clientSecret,
+            redirect_uri: redirectUri,
+            grant_type: 'authorization_code'
+          })
+        });
+
+        const tokenData = await tokenResponse.json();
+        if (!tokenResponse.ok || !tokenData.access_token) {
+          throw new Error(tokenData.error_description || tokenData.error || 'Failed to exchange Gmail authorization code');
+        }
+
+        // Fetch the connected Gmail user profile to confirm the email
+        const userinfoResponse = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+          headers: { Authorization: `Bearer ${tokenData.access_token}` }
+        });
+        const googleUser = await userinfoResponse.json();
+        const connectedEmail = (googleUser.email || '').toLowerCase().trim();
+
+        if (!connectedEmail) {
+          throw new Error('Could not identify the authorized Gmail email address.');
+        }
+
+        // Check if this sender already exists in sender_accounts
+        const sendersSnap = await db.ref('sender_accounts').get();
+        const existingAccounts = sendersSnap.val() || {};
+        const existingEntry = Object.entries(existingAccounts).find(([_, a]) => a && a.email && a.email.toLowerCase() === connectedEmail);
+        const senderId = existingEntry ? existingEntry[0] : ('snd_' + crypto.randomUUID().replace(/-/g, '').slice(0, 16));
+
+        let refreshToken = tokenData.refresh_token;
+        if (!refreshToken) {
+          if (existingEntry && existingEntry[1]?.credentials) {
+            try {
+              const { decryptCredentials } = require('./sending');
+              const existingSecret = decryptCredentials(encryptionKey, senderId, existingEntry[1].credentials);
+              if (existingSecret && existingSecret.refreshToken) {
+                refreshToken = existingSecret.refreshToken;
+              }
+            } catch (decErr) {
+              console.warn('[ADMIN GMAIL OAUTH] Could not decrypt existing credentials:', decErr.message);
+            }
+          }
+          if (!refreshToken) {
+            throw new Error('Google did not provide an offline refresh token. Please click Connect Gmail again and ensure all requested permissions are approved.');
+          }
+        }
+
+        // Build secret with full OAuth2 details
+        const secret = {
+          type: 'oauth2',
+          clientId,
+          clientSecret,
+          refreshToken,
+          host: 'smtp.gmail.com',
+          port: 465,
+          secure: true
+        };
+
+        const credentials = encryptCredentials(encryptionKey, senderId, secret);
+        const now = Date.now();
+
+        await db.ref(`sender_accounts/${senderId}`).set({
+          id: senderId,
+          email: connectedEmail,
+          name: googleUser.name || 'Gmail OAuth Sender',
+          provider: 'gmail_oauth',
+          authType: 'oauth2',
+          host: 'smtp.gmail.com',
+          port: 465,
+          username: connectedEmail,
+          credentials,
+          dailyLimit: 500,
+          status: 'active',
+          verifiedAt: now,
+          usage: existingEntry ? (existingEntry[1].usage || {}) : {},
+          createdAt: existingEntry ? (existingEntry[1].createdAt || now) : now,
+          updatedAt: now,
+          connectedBy: stateRecord.adminEmail || stateRecord.adminUid || 'admin'
+        });
+
+        // Record in admin audit logs
+        const logId = crypto.randomUUID();
+        await db.ref(`admin_logs/${logId}`).set({
+          adminId: stateRecord.adminUid || 'admin',
+          action: existingEntry ? 'sender.oauth_updated' : 'sender.oauth_connected',
+          target: senderId,
+          details: { email: connectedEmail, provider: 'gmail_oauth', name: googleUser.name || '' },
+          createdAt: now
+        }).catch(() => {});
+
+        console.log(`[ADMIN GMAIL OAUTH SENDER CONNECTED] ${connectedEmail} (ID: ${senderId})`);
+        return res.redirect(clientRedirect(`/admin/senders.html?sender_connected=success&email=${encodeURIComponent(connectedEmail)}`, req));
+      }
+
+      // Handle Standard User Gmail Connect Flow
       const uid = stateRecord.uid;
       const redirectUri = stateRecord.redirectUri || getGmailRedirectUri(req);
       const clientId = getClientId();
@@ -536,7 +750,9 @@ function createGoogleOAuthRoutes({
       res.redirect(clientRedirect(`/dashboard.html?gmail=connected&email=${encodeURIComponent(connectedEmail)}`, req));
     } catch (err) {
       console.error('[GMAIL OAUTH CALLBACK ERROR]', err.message);
-      res.redirect(clientRedirect(`/dashboard.html?error=${encodeURIComponent(err.message || 'Gmail connection failed.')}`, req));
+      const isAdm = stateRecord?.type === 'admin_gmail_connect';
+      const redirectTarget = isAdm ? '/admin/senders.html' : '/dashboard.html';
+      res.redirect(clientRedirect(`${redirectTarget}?error=${encodeURIComponent(err.message || 'Gmail connection failed.')}`, req));
     }
   });
 
