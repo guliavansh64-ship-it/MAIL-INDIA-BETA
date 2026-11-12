@@ -378,7 +378,58 @@ function createZetpayRoutes({ db, authenticate, ensureActive, provider, distribu
     }
   });
 
-  // 4. Return Redirect Handler (when customer completes payment via browser redirect)
+  // 4. Auto-Sync all pending orders for the authenticated user
+  router.all('/sync-pending', authenticate, ensureActive, async (req, res) => {
+    try {
+      const ordersSnap = await db.ref('payment_orders').get();
+      const allOrders = ordersSnap.val() || {};
+      const now = Date.now();
+      const oneDayAgo = now - (24 * 60 * 60 * 1000);
+
+      const userPendingOrders = Object.values(allOrders).filter(o =>
+        o && o.uid === req.user.uid &&
+        (o.status === 'created' || o.status === 'pending') &&
+        (o.createdAt || 0) > oneDayAgo
+      );
+
+      let creditedCount = 0;
+      let totalCreditsAdded = 0;
+
+      for (const order of userPendingOrders) {
+        try {
+          const zetpayStatus = await provider.getOrderStatus(order.orderId);
+          if (zetpayStatus && (zetpayStatus.status === 'success' || zetpayStatus.status === 'PAID' || zetpayStatus.status === 'COMPLETED')) {
+            await applyZetpayPayment(order.orderId, zetpayStatus);
+            creditedCount++;
+            totalCreditsAdded += (order.credits || 0);
+          } else if (zetpayStatus && (zetpayStatus.status === 'failed' || zetpayStatus.status === 'cancelled')) {
+            await db.ref('payment_orders/' + order.orderId).update({ status: 'failed' });
+          }
+        } catch (itemErr) {
+          console.warn(`[SYNC-PENDING CHECK FAIL] order: ${order.orderId}`, itemErr.message);
+        }
+      }
+
+      const walletSnap = await db.ref('wallets/' + req.user.uid).get();
+      const wallet = walletSnap.val() || {};
+
+      res.json({
+        success: true,
+        creditedCount,
+        totalCreditsAdded,
+        wallet: {
+          balance: wallet.balance || 0,
+          purchased: wallet.purchased || 0,
+          consumed: wallet.consumed || 0
+        }
+      });
+    } catch (err) {
+      console.error('[SYNC PENDING ERROR]', err);
+      res.status(500).json({ success: false, error: 'SYNC_FAILED', message: err.message });
+    }
+  });
+
+  // 5. Return Redirect Handler (when customer completes payment via browser redirect)
   router.get('/return', async (req, res) => {
     const orderId = req.query.zp_order;
     if (!orderId) {

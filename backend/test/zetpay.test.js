@@ -201,6 +201,61 @@ test('POST /api/payments/zetpay/verify commits wallet credits idempotently when 
   assert.equal(wallet.balance, 500); // Still exactly 500!
 });
 
+test('POST /api/payments/zetpay/sync-pending verifies and credits pending orders', async () => {
+  const db = createTestMemory();
+  const mockProvider = {
+    apiKey: 'zap_test_key',
+    async getOrderStatus(id) {
+      if (id === 'ZP_PENDING_SUCCESS') return { order_id: id, status: 'success', amount: 100 };
+      return { order_id: id, status: 'pending', amount: 100 };
+    }
+  };
+
+  const app = createApp({
+    auth,
+    db,
+    zetpayConfig: { apiKey: 'zap_test_key' },
+    zetpayProviderInstance: mockProvider,
+    sendingConfig: { enabled: true }
+  });
+
+  await db.ref('users/u_zetpay_test').set({ uid: 'u_zetpay_test', email: 'user@mailindia.in', status: 'active' });
+  await db.ref('wallets/u_zetpay_test').set({ balance: 0, reserved: 0, purchased: 0, consumed: 0 });
+
+  // Add one successful pending order and one still-pending order
+  await db.ref('payment_orders/ZP_PENDING_SUCCESS').set({
+    uid: 'u_zetpay_test',
+    orderId: 'ZP_PENDING_SUCCESS',
+    amountRupees: 100,
+    credits: 500,
+    status: 'created',
+    createdAt: Date.now() - 60000
+  });
+
+  await db.ref('payment_orders/ZP_STILL_PENDING').set({
+    uid: 'u_zetpay_test',
+    orderId: 'ZP_STILL_PENDING',
+    amountRupees: 100,
+    credits: 500,
+    status: 'created',
+    createdAt: Date.now() - 30000
+  });
+
+  const syncRes = await request(app)
+    .post('/api/payments/zetpay/sync-pending')
+    .set('Authorization', 'Bearer user_token')
+    .send();
+
+  assert.equal(syncRes.status, 200);
+  assert.equal(syncRes.body.success, true);
+  assert.equal(syncRes.body.creditedCount, 1);
+  assert.equal(syncRes.body.totalCreditsAdded, 500);
+  assert.equal(syncRes.body.wallet.balance, 500);
+
+  const orderSnap = (await db.ref('payment_orders/ZP_PENDING_SUCCESS').get()).val();
+  assert.equal(orderSnap.status, 'captured');
+});
+
 test('live ZetPay API connectivity with provided credentials', async (t) => {
   try {
     const provider = zetpayProvider('ZPPCCkPtfAH7EC78UMNT8kUqm7q5XdjNRSX');

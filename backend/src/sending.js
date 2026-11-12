@@ -132,14 +132,31 @@ async function runJob({db,key,uid,id,send=async(s,m,secret)=>transport(s.email,s
   // including when this user also connected a separate Gmail OAuth account.
   const assignment = (await db.ref(`sender_assignments/${uid}`).get()).val();
   const hasTenantPin = assignment?.manual === true && safeId(assignment.senderId);
+  const isGoogleUser = Boolean(
+    user?.authProvider === 'google' ||
+    user?.googleId ||
+    uid.startsWith('google_') ||
+    job.senderId === ('user_gmail_' + uid) ||
+    (typeof job.senderId === 'string' && job.senderId.startsWith('user_gmail_'))
+  );
+
+  // For users who logged in via Google with their own Google ID, their own connected Gmail is used
+  // unless an admin has explicitly pinned a specific tenant sender manually.
+  let gmailConn = null;
+  if (isGoogleUser && !hasTenantPin) {
+    gmailConn = (await db.ref(`gmail_connections/${uid}`).get()).val();
+  }
+
   const systemSenderId = String(process.env.SYSTEM_SENDER_ID || '').trim();
-  const pinnedSenderId = hasTenantPin ? assignment.senderId : systemSenderId;
+  const pinnedSenderId = hasTenantPin ? assignment.senderId : (isGoogleUser ? null : systemSenderId);
   const isPinnedSender = Boolean(pinnedSenderId);
   if (isPinnedSender && (!safeId(pinnedSenderId) || pinnedSenderId !== job.senderId)) {
     await transition(db, uid, id, ['processing'], 'failed', { error: 'SENDER_UNAVAILABLE' });
     return;
   }
-  const gmailConn = isPinnedSender ? null : (await db.ref(`gmail_connections/${uid}`).get()).val();
+  if (!gmailConn && !isPinnedSender) {
+    gmailConn = (await db.ref(`gmail_connections/${uid}`).get()).val();
+  }
   if (gmailConn && gmailConn.status === 'active' && gmailConn.encryptedRefreshToken) {
     try {
       const { sendViaConnectedGmail } = require('./gmail-api');
@@ -160,7 +177,7 @@ async function runJob({db,key,uid,id,send=async(s,m,secret)=>transport(s.email,s
           text: job.message.text,
           html: job.message.html,
           attachments: job.message.attachments,
-          fromName: job.message.fromName || 'Mail India'
+          fromName: job.message.fromName || (user?.name || 'Mail India')
         }
       });
       await transition(db, uid, id, ['processing'], 'accepted', {
@@ -175,6 +192,11 @@ async function runJob({db,key,uid,id,send=async(s,m,secret)=>transport(s.email,s
         await db.ref(`gmail_connections/${uid}/status`).set('needs_reconnect').catch(() => {});
       }
     }
+  }
+
+  if (job.senderId === ('user_gmail_' + uid) || (typeof job.senderId === 'string' && job.senderId.startsWith('user_gmail_'))) {
+    await transition(db, uid, id, ['processing'], 'failed', { error: 'GMAIL_NOT_CONNECTED' });
+    return;
   }
 
   let senderId=job.senderId;

@@ -2033,8 +2033,17 @@ CRITICAL RULES:
     const activeSenderEntries = Object.entries(sendersVal).filter(([_, s]) => s && s.status === 'active');
     const configuredSysId = sendingConfig.systemSenderId || process.env.SYSTEM_SENDER_ID;
 
-    if (safeId(assignment?.senderId) && assignment?.manual === true && sendersVal[assignment.senderId]?.status === 'active') {
+    const userProfile = (await db.ref('users/' + req.uid).get()).val();
+    const isGoogleAuthUser = Boolean(userProfile?.authProvider === 'google' || userProfile?.googleId || req.uid.startsWith('google_'));
+    const userGmail = (await db.ref('gmail_connections/' + req.uid).get()).val();
+    const hasActiveUserGmail = Boolean(userGmail && userGmail.status === 'active' && userGmail.encryptedRefreshToken);
+    const hasManualAdminPin = safeId(assignment?.senderId) && assignment?.manual === true && sendersVal[assignment.senderId]?.status === 'active';
+
+    if (hasManualAdminPin) {
       senderId = assignment.senderId;
+    } else if (isGoogleAuthUser && hasActiveUserGmail) {
+      // User signed in with Google and has active Gmail API authorization: send from user's own Gmail!
+      senderId = 'user_gmail_' + req.uid;
     } else if (configuredSysId && sendersVal[configuredSysId]?.status === 'active') {
       senderId = configuredSysId;
     } else if (activeSenderEntries.length > 0) {

@@ -185,3 +185,68 @@ test('an explicit tenant assignment overrides the global system sender', async (
     assert.equal(db.root.wallets.tenant.sendRequests[job.id].status, 'accepted');
   });
 });
+
+test('a user who signed in with Google dispatches via their own connected Gmail instead of admin sender', async () => {
+  const prevCid = process.env.GOOGLE_CLIENT_ID;
+  const prevSec = process.env.GOOGLE_CLIENT_SECRET;
+  process.env.GOOGLE_CLIENT_ID = 'test_mock_client_id';
+  process.env.GOOGLE_CLIENT_SECRET = 'test_mock_client_secret';
+  try {
+    await withSystemSender('admin_sys_sender', async () => {
+      const db = workerDb();
+      const gUid = 'google_998877';
+      db.root.users = db.root.users || {};
+      db.root.wallets = db.root.wallets || {};
+      db.root.gmail_connections = db.root.gmail_connections || {};
+      db.root.users[gUid] = { uid: gUid, email: 'googleuser@gmail.com', status: 'active', authProvider: 'google', name: 'Google User' };
+      db.root.wallets[gUid] = { balance: 5, reserved: 0, consumed: 0, sendRequests: {} };
+      db.root.gmail_connections[gUid] = {
+        email: 'googleuser@gmail.com',
+        status: 'active',
+        encryptedRefreshToken: encryptCredentials(key, gUid, { refreshToken: 'mock_refresh_token' })
+      };
+
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async (url) => {
+        const s = url.toString();
+        if (s.includes('oauth2.googleapis.com/token')) {
+          return { ok: true, json: async () => ({ access_token: 'mock_access_token', expires_in: 3600 }) };
+        }
+        if (s.includes('gmail.googleapis.com')) {
+          return { ok: true, json: async () => ({ id: 'gmail_msg_12345', threadId: 'th_1' }) };
+        }
+        throw new Error('unexpected fetch: ' + s);
+      };
+
+      const message = normalize({ to: 'recipient@example.com', subject: 'Google user email', text: 'Hello from my Gmail', consent: true });
+      const job = await reserve(db, gUid, 'g-send-1', message, 'user_gmail_' + gUid);
+
+      let smtpSenderCalled = false;
+      await runJob({
+        db,
+        key,
+        uid: gUid,
+        id: job.id,
+        send: async () => { smtpSenderCalled = true; }
+      });
+
+      // SMTP sender should NOT have been called because it sent via user's Gmail API!
+      assert.equal(smtpSenderCalled, false);
+      const updatedJob = db.root.wallets[gUid].sendRequests[job.id];
+      assert.equal(updatedJob.status, 'accepted');
+      assert.equal(updatedJob.provider, 'gmail_api');
+      assert.equal(updatedJob.senderEmail, 'googleuser@gmail.com');
+      assert.equal(updatedJob.providerMessageId, 'gmail_msg_12345');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+} finally {
+  if (prevCid === undefined) delete process.env.GOOGLE_CLIENT_ID;
+  else process.env.GOOGLE_CLIENT_ID = prevCid;
+  if (prevSec === undefined) delete process.env.GOOGLE_CLIENT_SECRET;
+  else process.env.GOOGLE_CLIENT_SECRET = prevSec;
+}
+});
+
