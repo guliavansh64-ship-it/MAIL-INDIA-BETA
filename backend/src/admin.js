@@ -309,22 +309,33 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
   }
 
   // ==========================================
-  // 1. ADMIN DASHBOARD & SUMMARY
+  // 1. ADMIN DASHBOARD & SUMMARY (OPTIMIZED & CACHED)
   // ==========================================
+  let cachedSummary = null;
+  let cachedSummaryTime = 0;
+  const SUMMARY_CACHE_TTL_MS = 5000; // 5-second responsive cache
+
   r.get('/summary', async (req, res) => {
     try {
-      const [uSnap, sSnap, wSnap, pSnap, rSnap, qSnap] = await Promise.all([
+      const now = Date.now();
+      if (cachedSummary && (now - cachedSummaryTime < SUMMARY_CACHE_TTL_MS)) {
+        return res.json(cachedSummary);
+      }
+
+      const [uSnap, sSnap, wSnap, pSnap, rSnap] = await Promise.all([
         db.ref('users').get(),
         db.ref('sender_accounts').get(),
         db.ref('wallets').get(),
         db.ref('payment_orders').get(),
-        db.ref('payment_refunds').get(),
-        scanQueueState(db)
+        db.ref('payment_refunds').get()
       ]);
+
+      const walletsVal = wSnap.val() || {};
+      const qSnap = await scanQueueState(db, undefined, walletsVal);
 
       const users = Object.values(uSnap.val() || {});
       const senders = Object.values(sSnap.val() || {});
-      const wallets = Object.values(wSnap.val() || {});
+      const wallets = Object.values(walletsVal);
       const payments = Object.values(pSnap.val() || {});
       const refunds = Object.values(rSnap.val() || {});
 
@@ -340,7 +351,7 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
       const totalCapturedPaise = payments.filter(x => x.status === 'captured').reduce((a, x) => a + (x.amountPaise || 0), 0);
       const totalRefundedPaise = refunds.filter(x => x.status === 'completed').reduce((a, x) => a + (x.amountPaise || 0), 0);
 
-      res.json({
+      const responseData = {
         success: true,
         users: users.length,
         activeUsers: users.filter(x => x.status === 'active').length,
@@ -358,7 +369,12 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
           unknownCount: qSnap.summary.unknownCount,
           dlqCount: qSnap.summary.dlqCount
         }
-      });
+      };
+
+      cachedSummary = responseData;
+      cachedSummaryTime = Date.now();
+
+      res.json(responseData);
     } catch {
       return res.status(500).json({ error: 'INTERNAL_SERVER_ERROR' });
     }

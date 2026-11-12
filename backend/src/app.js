@@ -392,9 +392,20 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
       : Boolean(req.user?.admin || adminEmails.includes(userEmail));
 
     let uDoc = {};
+    let wallet = { balance: 0, reserved: 0, purchased: 0, consumed: 0 };
     try {
-      const uSnap = await db.ref('users/' + req.user.uid).get();
+      const [uSnap, wSnap] = await Promise.all([
+        db.ref('users/' + req.user.uid).get(),
+        db.ref('wallets/' + req.user.uid).get()
+      ]);
       uDoc = uSnap.val() || {};
+      const wVal = wSnap.val() || {};
+      wallet = {
+        balance: Number.isSafeInteger(wVal.balance) ? wVal.balance : (Number(wVal.balance) || 0),
+        reserved: Number.isSafeInteger(wVal.reserved) ? wVal.reserved : (Number(wVal.reserved) || 0),
+        purchased: Number.isSafeInteger(wVal.purchased) ? wVal.purchased : (Number(wVal.purchased) || 0),
+        consumed: Number.isSafeInteger(wVal.consumed) ? wVal.consumed : (Number(wVal.consumed) || 0)
+      };
     } catch {}
 
     const userData = {
@@ -426,7 +437,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
         email: req.user?.email,
         authMethod: req.authMethod
       });
-      return res.json({ success: true, csrf, user: userData });
+      return res.json({ success: true, csrf, user: userData, wallet });
     }
     const csrf = crypto.randomBytes(32).toString('hex');
     console.log('[AUTHENTICATION STATUS RESTORED]', {
@@ -434,7 +445,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
       email: req.user?.email,
       authMethod: req.authMethod
     });
-    res.json({ success: true, csrf, user: userData });
+    res.json({ success: true, csrf, user: userData, wallet });
   }));
 
   app.post('/api/session/logout', onboardingAuth, wrap(async (req, res) => {
@@ -2120,11 +2131,13 @@ CRITICAL RULES:
   app.use(express.static(frontendDir, {
     index: 'index.html',
     extensions: ['html'],
+    etag: true,
+    lastModified: true,
     setHeaders: (res, filePath) => {
-      if (filePath.endsWith('.js') || filePath.endsWith('.css') || filePath.endsWith('.html')) {
-        res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
-        res.set('Pragma', 'no-cache');
-        res.set('Expires', '0');
+      if (filePath.endsWith('.js') || filePath.endsWith('.css')) {
+        res.set('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
+      } else if (filePath.endsWith('.html')) {
+        res.set('Cache-Control', 'no-cache');
       }
     }
   }));

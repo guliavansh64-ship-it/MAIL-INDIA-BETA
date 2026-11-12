@@ -7,19 +7,25 @@ const DEFAULT_STUCK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 /**
  * Scans for stuck jobs in wallets across the database.
  */
-async function scanQueueState(db, timeoutMs = DEFAULT_STUCK_TIMEOUT_MS) {
-  const [walletsSnap, dlqSnap] = await Promise.all([
-    db.ref('wallets').get(),
-    db.ref('queue_dlq').get()
-  ]);
+async function scanQueueState(db, timeoutMs = DEFAULT_STUCK_TIMEOUT_MS, preloadedWallets = null) {
+  let wallets = preloadedWallets;
+  let dlqSnap = null;
+  if (wallets && typeof wallets === 'object') {
+    dlqSnap = await db.ref('queue_dlq').get();
+  } else {
+    const [walletsSnap, qSnap] = await Promise.all([
+      db.ref('wallets').get(),
+      db.ref('queue_dlq').get()
+    ]);
+    wallets = walletsSnap.val() || {};
+    dlqSnap = qSnap;
+  }
 
   const now = Date.now();
   const stuckProcessing = [];
   const stuckQueued = [];
   const unknownJobs = [];
   const deadLetterJobs = [];
-
-  const wallets = walletsSnap.val() || {};
   for (const [uid, wallet] of Object.entries(wallets)) {
     if (!wallet || !wallet.sendRequests) continue;
     for (const [jobId, job] of Object.entries(wallet.sendRequests)) {
