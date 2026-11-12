@@ -37,13 +37,211 @@ const {
   purgeUserData
 } = require('./retention');
 
-function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, sendQueue = null, distributedLimiter = null, smtpFactory = transport }) {
+function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, sendQueue = null, distributedLimiter = null, smtpFactory = transport, auth = null, cookieOptions = { httpOnly: true, secure: true, sameSite: 'lax', path: '/' }, publicConfig = {} }) {
   const r = express.Router();
   const encKey = (key && typeof key === 'string' && Buffer.from(key, 'base64').length === 32)
     ? key
     : ((process.env.SENDER_ENCRYPTION_KEY && Buffer.from(process.env.SENDER_ENCRYPTION_KEY, 'base64').length === 32)
       ? process.env.SENDER_ENCRYPTION_KEY
       : crypto.createHash('sha256').update(process.env.SESSION_SECRET || 'mailbridge-master-session-salt-375ee').digest('base64'));
+
+  // =========================================================================
+  // DEDICATED SUPER ADMIN AUTHENTICATION (Completely Separated Admin Access)
+  // Only guliavansh64@gmail.com is permitted to authenticate as platform admin
+  // =========================================================================
+
+  // POST /api/admin/auth/login - Dedicated Administrator Login
+  r.post('/auth/login', async (req, res) => {
+    const rawEmail = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+    const idToken = String(req.body?.idToken || '').trim();
+
+    // STRICT USER ISOLATION: No user gmail or other accounts allowed into admin
+    if (rawEmail !== 'guliavansh64@gmail.com') {
+      return res.status(403).json({
+        success: false,
+        error: 'ADMIN_ACCESS_DENIED',
+        message: 'Access Denied: Only the authorized platform administrator (guliavansh64@gmail.com) can log in to the Super Admin Console. User accounts are strictly barred.'
+      });
+    }
+
+    if (!password && !idToken) {
+      return res.status(400).json({
+        success: false,
+        error: 'MISSING_CREDENTIALS',
+        message: 'Admin password is required.'
+      });
+    }
+
+    // Rate limiting for admin login
+    if (distributedLimiter && typeof distributedLimiter.checkScoped === 'function') {
+      const allowed = await distributedLimiter.checkScoped('adminLogin', req.ip || '127.0.0.1');
+      if (!allowed) {
+        return res.status(429).json({
+          success: false,
+          error: 'RATE_LIMIT_EXCEEDED',
+          message: 'Too many authentication attempts. Please wait 1 minute.'
+        });
+      }
+    }
+
+    try {
+      let verifiedUid = null;
+      let effectiveIdToken = idToken;
+
+      if (!effectiveIdToken && password) {
+        const apiKey = publicConfig.firebaseApiKey || process.env.FIREBASE_WEB_API_KEY;
+        if (!apiKey) {
+          return res.status(503).json({
+            success: false,
+            error: 'AUTH_UNAVAILABLE',
+            message: 'Firebase API configuration missing.'
+          });
+        }
+        const resp = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: 'guliavansh64@gmail.com', password, returnSecureToken: true })
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.idToken) {
+          const errMsg = (data.error?.message === 'INVALID_PASSWORD' || data.error?.message === 'EMAIL_NOT_FOUND' || data.error?.message === 'INVALID_LOGIN_CREDENTIALS')
+            ? 'Invalid administrator credentials. Please check your password.'
+            : (data.error?.message || 'Authentication failed.');
+          return res.status(401).json({
+            success: false,
+            error: 'INVALID_CREDENTIALS',
+            message: errMsg
+          });
+        }
+        effectiveIdToken = data.idToken;
+        verifiedUid = data.localId;
+      }
+
+      if (effectiveIdToken && !verifiedUid && auth) {
+        const decoded = await auth.verifyIdToken(effectiveIdToken, true).catch(() => null);
+        if (!decoded || (decoded.email || '').toLowerCase() !== 'guliavansh64@gmail.com') {
+          return res.status(403).json({
+            success: false,
+            error: 'ADMIN_ACCESS_DENIED',
+            message: 'Access Denied: Only guliavansh64@gmail.com can log in to the admin console.'
+          });
+        }
+        verifiedUid = decoded.uid;
+      }
+
+      verifiedUid = verifiedUid || 'admin_guliavansh64';
+
+      // Ensure super admin flag is persistently set in Realtime Database
+      try {
+        await db.ref(`users/${verifiedUid}/admin`).set(true);
+        await db.ref(`users/${verifiedUid}/emailVerified`).set(true);
+        await db.ref(`users/${verifiedUid}/status`).set('active');
+      } catch {}
+
+      // Create session cookie
+      const expiresIn = 8 * 60 * 60 * 1000;
+      let sessionCookie = '';
+      if (auth && typeof auth.createSessionCookie === 'function') {
+        try {
+          sessionCookie = await auth.createSessionCookie(effectiveIdToken, { expiresIn });
+        } catch {
+          sessionCookie = effectiveIdToken;
+        }
+      } else {
+        sessionCookie = effectiveIdToken;
+      }
+
+      const csrf = crypto.randomBytes(32).toString('hex');
+      const cookieOpts = { ...(cookieOptions || {}), maxAge: expiresIn };
+
+      res.cookie('__Host-mb_session', sessionCookie, cookieOpts);
+      res.cookie('mb_session', sessionCookie, cookieOpts);
+      res.cookie('__Host-mb_csrf', csrf, cookieOpts);
+      res.cookie('mb_csrf', csrf, cookieOpts);
+
+      return res.json({
+        success: true,
+        message: 'Super Administrator authenticated successfully.',
+        redirect: '/admin/index.html',
+        csrf,
+        token: effectiveIdToken,
+        user: {
+          uid: verifiedUid,
+          email: 'guliavansh64@gmail.com',
+          admin: true
+        }
+      });
+    } catch (err) {
+      console.error('[ADMIN LOGIN EXCEPTION]', err);
+      return res.status(500).json({
+        success: false,
+        error: 'ADMIN_LOGIN_ERROR',
+        message: err.message || 'Administrator sign in could not be completed.'
+      });
+    }
+  });
+
+  // GET /api/admin/auth/session - Verify Admin Session Status
+  r.get('/auth/session', async (req, res) => {
+    try {
+      const rawCookie = req.get('cookie') || '';
+      const parsedCookies = Object.fromEntries(rawCookie.split(';').map(x => x.trim().split(/=(.*)/s).slice(0, 2)).filter(x => x.length === 2));
+      const jar = { ...(req.cookies || {}), ...parsedCookies };
+      const authHeader = req.get('authorization') || '';
+      const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+      const token = jar['__Host-mb_session'] || jar['mb_session'] || bearerToken || '';
+
+      if (!token) {
+        return res.status(401).json({ success: false, authenticated: false, isAdmin: false, error: 'NO_SESSION' });
+      }
+
+      let decoded = null;
+      if (auth && typeof auth.verifySessionCookie === 'function') {
+        decoded = await auth.verifySessionCookie(token, true).catch(() => null);
+      }
+      if (!decoded && auth && typeof auth.verifyIdToken === 'function') {
+        decoded = await auth.verifyIdToken(token, true).catch(() => null);
+      }
+
+      if (!decoded || !decoded.uid) {
+        return res.status(401).json({ success: false, authenticated: false, isAdmin: false, error: 'INVALID_SESSION' });
+      }
+
+      const email = (decoded.email || '').toLowerCase();
+      if (email !== 'guliavansh64@gmail.com') {
+        return res.status(403).json({
+          success: false,
+          authenticated: true,
+          isAdmin: false,
+          error: 'ADMIN_ACCESS_DENIED',
+          message: 'Access Denied: Regular user accounts cannot access the admin portal.',
+          user: { uid: decoded.uid, email }
+        });
+      }
+
+      const csrf = jar['__Host-mb_csrf'] || jar['mb_csrf'] || crypto.randomBytes(32).toString('hex');
+      return res.json({
+        success: true,
+        authenticated: true,
+        isAdmin: true,
+        csrf,
+        user: { uid: decoded.uid, email, admin: true }
+      });
+    } catch (err) {
+      return res.status(500).json({ success: false, authenticated: false, isAdmin: false, error: err.message });
+    }
+  });
+
+  // POST /api/admin/auth/logout - Dedicated Administrator Sign Out
+  r.post('/auth/logout', (req, res) => {
+    const clearOpts = { ...(cookieOptions || {}), maxAge: 0 };
+    res.clearCookie('__Host-mb_session', clearOpts);
+    res.clearCookie('mb_session', clearOpts);
+    res.clearCookie('__Host-mb_csrf', clearOpts);
+    res.clearCookie('mb_csrf', clearOpts);
+    res.json({ success: true, message: 'Super Administrator signed out.', redirect: '/admin/login.html' });
+  });
 
   // Admin Authentication and Authorization Middleware
   r.use(authenticate, async (req, res, next) => {

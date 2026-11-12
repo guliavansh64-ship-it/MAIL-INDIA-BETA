@@ -1012,7 +1012,19 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
     const zetpayRoutes = createZetpayRoutes({ db, authenticate: firebaseAuth, ensureActive, provider: zetProvider, distributedLimiter });
     app.use('/api/payments/zetpay', zetpayRoutes.router);
   }
-  app.use('/api/admin', adminRoutes({ db, authenticate: firebaseAuth, key: sendingConfig.encryptionKey, paymentConfig, provider, sendQueue, distributedLimiter, smtpFactory: sendingConfig.smtpFactory }));
+  app.use('/api/admin', adminRoutes({
+    db,
+    authenticate: firebaseAuth,
+    key: sendingConfig.encryptionKey,
+    paymentConfig,
+    provider,
+    sendQueue,
+    distributedLimiter,
+    smtpFactory: sendingConfig.smtpFactory,
+    auth,
+    cookieOptions,
+    publicConfig
+  }));
 
   // Google OAuth & Gmail API Routes
   const googleOAuthRoutes = createGoogleOAuthRoutes({
@@ -2103,6 +2115,7 @@ CRITICAL RULES:
     path.join(__dirname, '../frontend')
   ];
   const frontendDir = candidateFrontendDirs.find(d => fs.existsSync(d)) || path.join(__dirname, '../../frontend');
+  app.get(['/admin/login', '/admin/login.html'], (req, res) => res.sendFile(path.join(frontendDir, 'admin/login.html')));
   app.get(['/admin', '/admin/'], (req, res) => res.sendFile(path.join(frontendDir, 'admin/index.html')));
   app.use(express.static(frontendDir, {
     index: 'index.html',

@@ -56,9 +56,13 @@ async function reserve(db,uid,idempotencyKey,message,senderId){
     w.sendRequests=w.sendRequests||{};
     let prior=w.sendRequests[id];
     if(prior)return w;
-    if(!Number.isSafeInteger(w.balance)||w.balance<1||!Number.isSafeInteger(w.reserved||0)||!Number.isSafeInteger(w.consumed||0))return;
-    w.balance--;
-    w.reserved=(w.reserved||0)+1;
+    const curBal = Number.isSafeInteger(w.balance) ? w.balance : (Number.isFinite(Number(w.balance)) ? Math.floor(Number(w.balance)) : 0);
+    const curRes = Number.isSafeInteger(w.reserved) ? w.reserved : 0;
+    const curCons = Number.isSafeInteger(w.consumed) ? w.consumed : 0;
+    if(curBal < 1) return;
+    w.balance = curBal - 1;
+    w.reserved = curRes + 1;
+    w.consumed = curCons;
     w.sendRequests[id]={id,status:'queued',fingerprint,message,senderId,createdAt:now};
     w.ledger=w.ledger||{};
     w.ledger['reserve_'+id]={type:'reserve',credits:-1,reference:id,createdAt:now};
