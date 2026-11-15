@@ -103,6 +103,29 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
   );
   const equalCsrf = (a, b) => typeof a === 'string' && typeof b === 'string' && /^[a-f0-9]{64}$/.test(a) && /^[a-f0-9]{64}$/.test(b) && crypto.timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
 
+  const tokenCache = new Map();
+  const TOKEN_CACHE_TTL = 30000; // 30-second token verification cache
+
+  async function cachedVerifyIdToken(token) {
+    const key = 'id_' + token;
+    const now = Date.now();
+    const hit = tokenCache.get(key);
+    if (hit && now < hit.expiresAt) return hit.user;
+    const user = await auth.verifyIdToken(token, true);
+    tokenCache.set(key, { user, expiresAt: now + TOKEN_CACHE_TTL });
+    return user;
+  }
+
+  async function cachedVerifySessionCookie(token) {
+    const key = 'sess_' + token;
+    const now = Date.now();
+    const hit = tokenCache.get(key);
+    if (hit && now < hit.expiresAt) return hit.user;
+    const user = await auth.verifySessionCookie(token, true);
+    tokenCache.set(key, { user, expiresAt: now + TOKEN_CACHE_TTL });
+    return user;
+  }
+
   const authenticateFirebase = ({ allowUnverified = false } = {}) => wrap(async (req, res, next) => {
     if (typeof connectionStatus === 'function' && !['ready', 'connected'].includes(connectionStatus().authentication?.state)) {
       return fail(res, 503, 'AUTH_UNAVAILABLE', 'Firebase Admin is not connected. Check the backend service-account configuration.');
@@ -113,7 +136,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
       let authed = false;
       if (m) {
         try {
-          req.user = await auth.verifyIdToken(m[1], true);
+          req.user = await cachedVerifyIdToken(m[1]);
           req.authMethod = 'bearer';
           authed = true;
         } catch {
@@ -121,7 +144,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
         }
         if (!authed) {
           try {
-            req.user = await auth.verifySessionCookie(m[1], true);
+            req.user = await cachedVerifySessionCookie(m[1]);
             req.authMethod = 'bearer';
             authed = true;
           } catch {
@@ -133,7 +156,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
         const candidateTokens = [jar['__Host-mb_session'], jar['mb_session']].filter(Boolean);
         for (const sessionToken of candidateTokens) {
           try {
-            req.user = await auth.verifySessionCookie(sessionToken, true);
+            req.user = await cachedVerifySessionCookie(sessionToken);
             req.authMethod = 'cookie';
             if (!allowUnverified && req.user.email_verified !== true) {
               return fail(res, 403, 'EMAIL_NOT_VERIFIED', 'Verify your email address before accessing your account.');
@@ -393,10 +416,15 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
 
     let uDoc = {};
     let wallet = { balance: 0, reserved: 0, purchased: 0, consumed: 0 };
+    let stats = { total: 0, accepted: 0, failed: 0, today: 0, monthly: 0, rechargePaise: 0, dailyActivity: [] };
+    let recentEmails = [];
+    let recentTransactions = [];
+    let activeKeysCount = 0;
     try {
-      const [uSnap, wSnap] = await Promise.all([
+      const [uSnap, wSnap, kSnap] = await Promise.all([
         db.ref('users/' + req.user.uid).get(),
-        db.ref('wallets/' + req.user.uid).get()
+        db.ref('wallets/' + req.user.uid).get(),
+        db.ref('user_api_keys/' + req.user.uid).get()
       ]);
       uDoc = uSnap.val() || {};
       const wVal = wSnap.val() || {};
@@ -406,6 +434,53 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
         purchased: Number.isSafeInteger(wVal.purchased) ? wVal.purchased : (Number(wVal.purchased) || 0),
         consumed: Number.isSafeInteger(wVal.consumed) ? wVal.consumed : (Number(wVal.consumed) || 0)
       };
+
+      const jobs = Object.values(wVal.sendRequests || {});
+      const now = Date.now();
+      const todayStr = new Date(now).toISOString().slice(0, 10);
+      const thirtyDaysAgo = now - (30 * 86400000);
+      const acceptedJobs = jobs.filter(j => j.status === 'accepted');
+      const failedJobs = jobs.filter(j => j.status === 'failed');
+      const todayJobs = jobs.filter(j => Number.isSafeInteger(j.createdAt) && j.createdAt > 0 && new Date(j.createdAt).toISOString().slice(0, 10) === todayStr);
+      const monthlyJobs = jobs.filter(j => Number.isSafeInteger(j.createdAt) && j.createdAt >= thirtyDaysAgo);
+
+      const dailyActivity = [];
+      const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      for (let i = 6; i >= 0; i--) {
+        const d = new Date(now - (i * 86400000));
+        const dStr = d.toISOString().slice(0, 10);
+        const dayJobs = jobs.filter(j => Number.isSafeInteger(j.createdAt) && new Date(j.createdAt).toISOString().slice(0, 10) === dStr);
+        dailyActivity.push({
+          date: dStr,
+          day: dayNames[d.getUTCDay()],
+          accepted: dayJobs.filter(j => j.status === 'accepted').length,
+          failed: dayJobs.filter(j => j.status === 'failed').length,
+          total: dayJobs.length
+        });
+      }
+
+      const rechargePaise = Object.values(wVal.ledger || {}).filter(x => x.type === 'purchase' && Number.isSafeInteger(x.amountPaise)).reduce((a, x) => a + x.amountPaise, 0);
+
+      stats = {
+        total: jobs.length,
+        accepted: acceptedJobs.length,
+        failed: failedJobs.length,
+        today: todayJobs.length,
+        monthly: monthlyJobs.length,
+        rechargePaise,
+        dailyActivity
+      };
+
+      recentEmails = [...jobs].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 5).map(j => ({
+        id: j.id,
+        recipient: j.message?.to || '',
+        subject: j.message?.subject || '',
+        status: j.status,
+        createdAt: j.createdAt
+      }));
+
+      recentTransactions = Object.entries(wVal.ledger || {}).map(([id, item]) => ({ id, ...item })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 5);
+      activeKeysCount = Object.values(kSnap.val() || {}).filter(x => x.status === 'active').length;
     } catch {}
 
     const userData = {
@@ -437,7 +512,7 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
         email: req.user?.email,
         authMethod: req.authMethod
       });
-      return res.json({ success: true, csrf, user: userData, wallet });
+      return res.json({ success: true, csrf, user: userData, wallet, stats, recentEmails, recentTransactions, keys: activeKeysCount });
     }
     const csrf = crypto.randomBytes(32).toString('hex');
     console.log('[AUTHENTICATION STATUS RESTORED]', {
@@ -445,10 +520,11 @@ function createApp({ auth, db, origins = [], publicConfig = {}, paymentConfig = 
       email: req.user?.email,
       authMethod: req.authMethod
     });
-    res.json({ success: true, csrf, user: userData, wallet });
+    res.json({ success: true, csrf, user: userData, wallet, stats, recentEmails, recentTransactions, keys: activeKeysCount });
   }));
 
   app.post('/api/session/logout', onboardingAuth, wrap(async (req, res) => {
+    tokenCache.clear();
     res.clearCookie('__Host-mb_session', cookieOptions);
     res.clearCookie('__Host-mb_csrf', cookieOptions);
     res.clearCookie('mb_session', { ...cookieOptions, secure: false });
@@ -2064,8 +2140,8 @@ CRITICAL RULES:
 
     if (hasManualAdminPin) {
       senderId = assignment.senderId;
-    } else if (isGoogleAuthUser && hasActiveUserGmail) {
-      // User signed in with Google and has active Gmail API authorization: send from user's own Gmail!
+    } else if (hasActiveUserGmail || isGoogleAuthUser) {
+      // User signed in with Google or has connected Gmail: strictly send from user's own Gmail!
       senderId = 'user_gmail_' + req.uid;
     } else if (configuredSysId && sendersVal[configuredSysId]?.status === 'active') {
       senderId = configuredSysId;

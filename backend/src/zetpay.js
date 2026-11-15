@@ -381,16 +381,22 @@ function createZetpayRoutes({ db, authenticate, ensureActive, provider, distribu
   // 4. Auto-Sync all pending orders for the authenticated user
   router.all('/sync-pending', authenticate, ensureActive, async (req, res) => {
     try {
-      const ordersSnap = await db.ref('payment_orders').get();
-      const allOrders = ordersSnap.val() || {};
-      const now = Date.now();
-      const oneDayAgo = now - (24 * 60 * 60 * 1000);
-
-      const userPendingOrders = Object.values(allOrders).filter(o =>
-        o && o.uid === req.user.uid &&
-        (o.status === 'created' || o.status === 'pending') &&
-        (o.createdAt || 0) > oneDayAgo
-      );
+      let userPendingOrders = [];
+      const bodyOrderIds = Array.isArray(req.body?.orderIds) ? req.body.orderIds.filter(x => typeof x === 'string') : null;
+      if (bodyOrderIds && bodyOrderIds.length > 0) {
+        const snaps = await Promise.all(bodyOrderIds.map(oid => db.ref('payment_orders/' + oid).get()));
+        userPendingOrders = snaps.map(s => s.val()).filter(o => o && o.uid === req.user.uid && (o.status === 'created' || o.status === 'pending'));
+      } else {
+        const ordersSnap = await db.ref('payment_orders').get();
+        const allOrders = ordersSnap.val() || {};
+        const now = Date.now();
+        const oneDayAgo = now - (24 * 60 * 60 * 1000);
+        userPendingOrders = Object.values(allOrders).filter(o =>
+          o && o.uid === req.user.uid &&
+          (o.status === 'created' || o.status === 'pending') &&
+          (o.createdAt || 0) > oneDayAgo
+        );
+      }
 
       let creditedCount = 0;
       let totalCreditsAdded = 0;

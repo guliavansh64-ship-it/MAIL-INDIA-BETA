@@ -115,7 +115,7 @@ function createGoogleOAuthRoutes({
       const state = crypto.randomBytes(24).toString('hex');
       const redirectUri = getGoogleAuthRedirectUri(req);
       const clientId = getClientId();
-      const wantsGmail = req.query.connect === 'gmail';
+      const wantsGmail = req.query.connect === 'gmail' || req.query.gmail === '1';
       const scope = wantsGmail
         ? 'openid email profile https://www.googleapis.com/auth/gmail.send'
         : (req.query.scope || 'openid email profile');
@@ -378,13 +378,28 @@ function createGoogleOAuthRoutes({
             encryptedRefreshToken,
             status: 'active',
             scopes: tokenData.scope ? tokenData.scope.split(' ') : ['https://www.googleapis.com/auth/gmail.send'],
-            connectedAt: Date.now()
+            connectedAt: Date.now(),
+            lastRefreshedAt: Date.now()
           });
           gmailLinked = true;
           console.log('[GMAIL AUTO-CONNECTED VIA GOOGLE SIGNIN]', { uid, email: userEmail });
         } catch (connErr) {
           console.warn('[GMAIL AUTO-CONNECT FAILED]', connErr.message);
         }
+      } else {
+        // Re-login: check if user already had an active Gmail connection with refresh token
+        try {
+          const existingSnap = await db.ref(`gmail_connections/${uid}`).get();
+          const existing = existingSnap.val();
+          if (existing && existing.encryptedRefreshToken) {
+            await db.ref(`gmail_connections/${uid}`).update({
+              email: userEmail,
+              status: 'active',
+              lastRefreshedAt: Date.now()
+            });
+            gmailLinked = true;
+          }
+        } catch {}
       }
 
       // Redirect to dashboard with welcome toast, session token and gmail connected flag if applicable

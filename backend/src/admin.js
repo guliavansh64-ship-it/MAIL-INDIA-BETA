@@ -182,6 +182,28 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
     }
   });
 
+  const adminTokenCache = new Map();
+  async function cachedAdminVerifyToken(tok) {
+    if (!tok || typeof tok !== 'string') return null;
+    const now = Date.now();
+    const entry = adminTokenCache.get(tok);
+    if (entry && (now - entry.timestamp < 30000)) {
+      return entry.decoded;
+    }
+    let decoded = null;
+    if (auth && typeof auth.verifySessionCookie === 'function') {
+      decoded = await auth.verifySessionCookie(tok, true).catch(() => null);
+    }
+    if (!decoded && auth && typeof auth.verifyIdToken === 'function') {
+      decoded = await auth.verifyIdToken(tok, true).catch(() => null);
+    }
+    if (decoded && decoded.uid) {
+      if (adminTokenCache.size > 200) adminTokenCache.clear();
+      adminTokenCache.set(tok, { decoded, timestamp: now });
+    }
+    return decoded;
+  }
+
   // GET /api/admin/auth/session - Verify Admin Session Status
   r.get('/auth/session', async (req, res) => {
     try {
@@ -196,13 +218,7 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
         return res.status(401).json({ success: false, authenticated: false, isAdmin: false, error: 'NO_SESSION' });
       }
 
-      let decoded = null;
-      if (auth && typeof auth.verifySessionCookie === 'function') {
-        decoded = await auth.verifySessionCookie(token, true).catch(() => null);
-      }
-      if (!decoded && auth && typeof auth.verifyIdToken === 'function') {
-        decoded = await auth.verifyIdToken(token, true).catch(() => null);
-      }
+      const decoded = await cachedAdminVerifyToken(token);
 
       if (!decoded || !decoded.uid) {
         return res.status(401).json({ success: false, authenticated: false, isAdmin: false, error: 'INVALID_SESSION' });
@@ -235,6 +251,7 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
 
   // POST /api/admin/auth/logout - Dedicated Administrator Sign Out
   r.post('/auth/logout', (req, res) => {
+    adminTokenCache.clear();
     const clearOpts = { ...(cookieOptions || {}), maxAge: 0 };
     res.clearCookie('__Host-mb_session', clearOpts);
     res.clearCookie('mb_session', clearOpts);
@@ -381,33 +398,43 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
   });
 
   // ==========================================
-  // 2. USER MANAGEMENT
+  // 2. USER MANAGEMENT (CACHED & OPTIMIZED)
   // ==========================================
+  let cachedUsersList = null;
+  let cachedUsersTime = 0;
+  const USERS_CACHE_TTL_MS = 5000;
+
   r.get('/users', async (req, res) => {
     try {
-      const [snap, wSnap] = await Promise.all([
-        db.ref('users').get(),
-        db.ref('wallets').get()
-      ]);
-      const wallets = wSnap.val() || {};
-      const items = [];
-      for (const [key, u] of Object.entries(snap.val() || {})) {
-        const w = wallets[key] || {};
-        items.push({
-          uid: key,
-          name: u.name || '',
-          email: u.email || '',
-          status: u.status || 'active',
-          admin: Boolean(
-            u.email && u.email.toLowerCase() === 'guliavansh64@gmail.com'
-              ? true
-              : (u.email && u.email.toLowerCase().endsWith('@gmail.com') ? false : (u.admin || u.role === 'admin'))
-          ),
-          balance: w.balance || 0,
-          consumed: w.consumed || 0,
-          createdAt: u.createdAt || null,
-          apiRateLimit: u.apiRateLimit || 120
-        });
+      const now = Date.now();
+      let items = cachedUsersList;
+      if (!items || (now - cachedUsersTime >= USERS_CACHE_TTL_MS)) {
+        const [snap, wSnap] = await Promise.all([
+          db.ref('users').get(),
+          db.ref('wallets').get()
+        ]);
+        const wallets = wSnap.val() || {};
+        items = [];
+        for (const [key, u] of Object.entries(snap.val() || {})) {
+          const w = wallets[key] || {};
+          items.push({
+            uid: key,
+            name: u.name || '',
+            email: u.email || '',
+            status: u.status || 'active',
+            admin: Boolean(
+              u.email && u.email.toLowerCase() === 'guliavansh64@gmail.com'
+                ? true
+                : (u.email && u.email.toLowerCase().endsWith('@gmail.com') ? false : (u.admin || u.role === 'admin'))
+            ),
+            balance: w.balance || 0,
+            consumed: w.consumed || 0,
+            createdAt: u.createdAt || null,
+            apiRateLimit: u.apiRateLimit || 120
+          });
+        }
+        cachedUsersList = items;
+        cachedUsersTime = now;
       }
       const q = String(req.query.search || '').trim().toLowerCase().slice(0, 100);
       const filtered = q ? items.filter(u => (u.uid + ' ' + u.email + ' ' + u.name).toLowerCase().includes(q)) : items;
@@ -547,8 +574,14 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
   // ==========================================
   // 3. GMAIL SENDER POOL
   // ==========================================
+  let cachedSenders = null;
+  let cachedSendersTime = 0;
   r.get('/senders', async (req, res) => {
     try {
+      const now = Date.now();
+      if (cachedSenders && (now - cachedSendersTime < 5000)) {
+        return res.json(cachedSenders);
+      }
       const snap = await db.ref('sender_accounts').get();
       const items = [];
       for (const [key, v] of Object.entries(snap.val() || {})) {
@@ -568,7 +601,9 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
           createdAt: v.createdAt
         });
       }
-      res.json({ success: true, senders: items });
+      cachedSenders = { success: true, senders: items };
+      cachedSendersTime = now;
+      res.json(cachedSenders);
     } catch {
       return res.status(500).json({ error: 'INTERNAL_SERVER_ERROR' });
     }
@@ -1081,10 +1116,18 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
   // ==========================================
   // 8. RAZORPAY PAYMENTS
   // ==========================================
+  let cachedPayments = null;
+  let cachedPaymentsTime = 0;
   r.get('/payments', async (req, res) => {
     try {
+      const q = String(req.query.search || '').trim().toLowerCase().slice(0, 100);
+      const now = Date.now();
+      let items;
+      if (!q && cachedPayments && (now - cachedPaymentsTime < 5000)) {
+        return res.json(cachedPayments);
+      }
       const snap = await db.ref('payment_orders').get();
-      const items = [];
+      items = [];
       for (const [key, p] of Object.entries(snap.val() || {})) {
         items.push({
           orderId: key,
@@ -1101,9 +1144,13 @@ function adminRoutes({ db, authenticate, key, paymentConfig = {}, provider, send
         });
       }
       items.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-      const q = String(req.query.search || '').trim().toLowerCase().slice(0, 100);
       const filtered = q ? items.filter(p => (p.orderId + ' ' + p.uid + ' ' + (p.paymentId || '')).toLowerCase().includes(q)) : items;
-      res.json({ success: true, payments: filtered.slice(0, 100), truncated: filtered.length > 100, refundsSupported: true });
+      const respPayload = { success: true, payments: filtered.slice(0, 100), truncated: filtered.length > 100, refundsSupported: true };
+      if (!q) {
+        cachedPayments = respPayload;
+        cachedPaymentsTime = now;
+      }
+      res.json(respPayload);
     } catch {
       return res.status(500).json({ error: 'INTERNAL_SERVER_ERROR' });
     }

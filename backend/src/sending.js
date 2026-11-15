@@ -191,15 +191,21 @@ async function runJob({db,key,uid,id,send=async(s,m,secret)=>transport(s.email,s
       });
       return;
     } catch (gmailErr) {
-      console.warn(`[GMAIL API DISPATCH EXCEPTION, ATTEMPTING POOL FALLBACK] uid: ${uid}`, gmailErr.message);
+      console.warn(`[GMAIL API DISPATCH EXCEPTION] uid: ${uid}`, gmailErr.message);
       if (gmailErr.code === 'GMAIL_TOKEN_REVOKED') {
         await db.ref(`gmail_connections/${uid}/status`).set('needs_reconnect').catch(() => {});
+        await transition(db, uid, id, ['processing'], 'failed', { error: 'GMAIL_TOKEN_REVOKED', message: 'Gmail authorization expired or was revoked. Please reconnect in Profile.' });
+        return;
+      }
+      if (isGoogleUser || job.senderId === ('user_gmail_' + uid) || (typeof job.senderId === 'string' && job.senderId.startsWith('user_gmail_'))) {
+        await transition(db, uid, id, ['processing'], 'failed', { error: 'GMAIL_DISPATCH_FAILED', message: gmailErr.message || 'Gmail API dispatch failed.' });
+        return;
       }
     }
   }
 
-  if (job.senderId === ('user_gmail_' + uid) || (typeof job.senderId === 'string' && job.senderId.startsWith('user_gmail_'))) {
-    await transition(db, uid, id, ['processing'], 'failed', { error: 'GMAIL_NOT_CONNECTED' });
+  if (isGoogleUser || job.senderId === ('user_gmail_' + uid) || (typeof job.senderId === 'string' && job.senderId.startsWith('user_gmail_'))) {
+    await transition(db, uid, id, ['processing'], 'failed', { error: 'GMAIL_NOT_CONNECTED', message: 'User Gmail account is not connected. Please connect your Google account to send emails.' });
     return;
   }
 
